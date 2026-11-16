@@ -26,6 +26,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.ui.layout.layout
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -50,6 +52,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
@@ -120,7 +123,9 @@ data class TaskEntity(
     val archivedFromList: Boolean = false,
     val playlist: String = "main",
     val doneCount: Int = 0,
-    val lastPickedAt: Long = 0L
+    val lastPickedAt: Long = 0L,
+    val isSeparator: Boolean = false,
+    val archivedAt: Long = 0L
 )
 
 @Entity(tableName = "subtasks")
@@ -152,16 +157,22 @@ interface TaskDao {
     @Query("SELECT * FROM tasks WHERE playlist = :playlist AND archivedFromList = 0 ORDER BY queueOrder ASC")
     fun getTodayList(playlist: String): kotlinx.coroutines.flow.Flow<List<TaskEntity>>
 
-    @Query("UPDATE tasks SET archivedFromList = 1 WHERE playlist = :playlist AND archivedFromList = 0")
-    suspend fun archiveCompleted(playlist: String)
+    @Query("UPDATE tasks SET archivedFromList = 1, archivedAt = :now WHERE playlist = :playlist AND archivedFromList = 0 AND isSeparator = 0")
+    suspend fun archiveCompleted(playlist: String, now: Long)
 
-    @Query("UPDATE tasks SET archivedFromList = 1 WHERE id = :id")
-    suspend fun archiveOne(id: Long)
+    @Query("UPDATE tasks SET archivedFromList = 1, archivedAt = :now WHERE id = :id")
+    suspend fun archiveOne(id: Long, now: Long)
+
+    @Query("UPDATE tasks SET isCompleted = 0, completedAt = NULL WHERE playlist = :playlist AND isCompleted = 1 AND archivedFromList = 0")
+    suspend fun uncheckAll(playlist: String)
+
+    @Query("UPDATE tasks SET title = :label WHERE id = :id")
+    suspend fun setLabel(id: Long, label: String)
 
     @Query("SELECT * FROM tasks WHERE id = :id")
     fun observeTask(id: Long): kotlinx.coroutines.flow.Flow<TaskEntity?>
 
-    @Query("SELECT * FROM tasks WHERE playlist = 'cleaning' AND isCompleted = 0 AND archivedFromList = 0")
+    @Query("SELECT * FROM tasks WHERE playlist = 'cleaning' AND isCompleted = 0 AND archivedFromList = 0 AND isSeparator = 0")
     suspend fun cleaningBank(): List<TaskEntity>
 
     @Query("UPDATE tasks SET lastPickedAt = :now WHERE id = :id")
@@ -190,22 +201,22 @@ interface TaskDao {
     @Query("DELETE FROM subtasks WHERE taskId NOT IN (SELECT id FROM tasks)")
     suspend fun purgeOrphanSubtasks()
 
-    @Query("SELECT * FROM tasks WHERE isCompleted = 0 AND archivedFromList = 0 AND playlist = :playlist ORDER BY queueOrder ASC")
+    @Query("SELECT * FROM tasks WHERE isCompleted = 0 AND archivedFromList = 0 AND isSeparator = 0 AND playlist = :playlist ORDER BY queueOrder ASC")
     fun getActiveQueue(playlist: String): kotlinx.coroutines.flow.Flow<List<TaskEntity>>
 
-    @Query("SELECT * FROM tasks WHERE archivedFromList = 1 ORDER BY COALESCE(completedAt, queueOrder) DESC")
+    @Query("SELECT * FROM tasks WHERE archivedFromList = 1 ORDER BY archivedAt DESC")
     fun getArchivedTasks(): kotlinx.coroutines.flow.Flow<List<TaskEntity>>
 
     @Query("SELECT MAX(queueOrder) FROM tasks")
     suspend fun getMaxQueueOrder(): Long?
 
-    @Query("SELECT MIN(queueOrder) FROM tasks WHERE isCompleted = 0")
+    @Query("SELECT MIN(queueOrder) FROM tasks WHERE isCompleted = 0 AND isSeparator = 0")
     suspend fun getMinQueueOrder(): Long?
 
     @Insert
     suspend fun insert(task: TaskEntity): Long
 
-    @Query("SELECT * FROM tasks WHERE isCompleted = 0 AND archivedFromList = 0 AND playlist = :playlist ORDER BY queueOrder ASC")
+    @Query("SELECT * FROM tasks WHERE isCompleted = 0 AND archivedFromList = 0 AND isSeparator = 0 AND playlist = :playlist ORDER BY queueOrder ASC")
     suspend fun getActiveOnce(playlist: String): List<TaskEntity>
 
     @Insert
@@ -222,9 +233,21 @@ interface TaskDao {
 
     @Query("DELETE FROM tasks WHERE archivedFromList = 1")
     suspend fun clearArchive()
+
+    @Query("SELECT * FROM tasks ORDER BY id")
+    suspend fun allTasksOnce(): List<TaskEntity>
+
+    @Query("SELECT * FROM subtasks ORDER BY id")
+    suspend fun allSubtasksOnce(): List<SubtaskEntity>
+
+    @Query("DELETE FROM tasks")
+    suspend fun deleteAllTasks()
+
+    @Query("DELETE FROM subtasks")
+    suspend fun deleteAllSubtasks()
 }
 
-@Database(entities = [TaskEntity::class, SubtaskEntity::class], version = 6, exportSchema = false)
+@Database(entities = [TaskEntity::class, SubtaskEntity::class], version = 7, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun taskDao(): TaskDao
 
@@ -258,6 +281,12 @@ abstract class AppDatabase : RoomDatabase() {
                     override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
                         db.execSQL("ALTER TABLE tasks ADD COLUMN doneCount INTEGER NOT NULL DEFAULT 0")
                         db.execSQL("ALTER TABLE tasks ADD COLUMN lastPickedAt INTEGER NOT NULL DEFAULT 0")
+                    }
+                }, object : androidx.room.migration.Migration(6, 7) {
+                    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                        db.execSQL("ALTER TABLE tasks ADD COLUMN isSeparator INTEGER NOT NULL DEFAULT 0")
+                        db.execSQL("ALTER TABLE tasks ADD COLUMN archivedAt INTEGER NOT NULL DEFAULT 0")
+                        db.execSQL("UPDATE tasks SET archivedAt = COALESCE(completedAt, ${System.currentTimeMillis()}) WHERE archivedFromList = 1")
                     }
                 }).build().also { INSTANCE = it }
             }
@@ -307,10 +336,19 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         viewModelScope.launch { dao.addFocusSession(taskId) }
     }
 
-    fun archiveTask(task: TaskEntity) { viewModelScope.launch { dao.archiveOne(task.id) } }
+    fun archiveTask(task: TaskEntity) { viewModelScope.launch { dao.archiveOne(task.id, System.currentTimeMillis()) } }
+
+    fun deleteSeparator(task: TaskEntity) { viewModelScope.launch { dao.delete(task) } }
+    fun setSeparatorLabel(task: TaskEntity, label: String) { viewModelScope.launch { dao.setLabel(task.id, label.trim()) } }
+    fun addSeparator(label: String) {
+        viewModelScope.launch {
+            val order = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L
+            dao.insert(TaskEntity(title = label.trim(), queueOrder = order, playlist = _playlist.value, isSeparator = true))
+        }
+    }
 
     fun archiveAll() {
-        viewModelScope.launch { dao.archiveCompleted(_playlist.value) }
+        viewModelScope.launch { dao.archiveCompleted(_playlist.value, System.currentTimeMillis()) }
     }
 
     fun setFocusSessions(taskId: Long, count: Int) {
@@ -407,6 +445,10 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
     fun clearArchive() {
         viewModelScope.launch { dao.clearArchive(); dao.purgeOrphanSubtasks() }
     }
+
+    suspend fun exportText(settings: Map<String, String>): String = Backup.export(dao, settings)
+    suspend fun importAdd(p: Backup.Parsed) = Backup.importAdd(dao, p)
+    suspend fun importReplace(p: Backup.Parsed) = Backup.importReplace(dao, p)
 }
 
 class TaskViewModelFactory(private val dao: TaskDao, private val prefs: android.content.SharedPreferences) : ViewModelProvider.Factory {
@@ -418,7 +460,11 @@ class TaskViewModelFactory(private val dao: TaskDao, private val prefs: android.
 
 enum class HapticStyle { TICK, CONFIRM, SHATTER }
 
+/** Master switch for vibration, set from Settings. */
+object Haptics { var enabled = true }
+
 fun triggerHaptic(context: Context, style: HapticStyle) {
+    if (!Haptics.enabled) return
     val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
         manager.defaultVibrator
@@ -495,11 +541,12 @@ class MainActivity : ComponentActivity() {
             val context = LocalContext.current
             val db = remember { AppDatabase.get(context) }
             val viewModel: TaskViewModel = viewModel(factory = TaskViewModelFactory(db.taskDao(), context.getSharedPreferences("mono_prefs", Context.MODE_PRIVATE)))
-            var isOledDark by remember { mutableStateOf(true) }
+            val themePrefs = remember { context.getSharedPreferences("mono_prefs", Context.MODE_PRIVATE) }
+            var isOledDark by remember { mutableStateOf(themePrefs.getBoolean("dark", true)) }
 
             val playlistKey by viewModel.playlist.collectAsState()
             MonoFocusTheme(isDark = isOledDark, playlist = playlistKey) {
-                MonoFocusApp(viewModel = viewModel, isOledDark = isOledDark, onToggleTheme = { isOledDark = !isOledDark })
+                MonoFocusApp(viewModel = viewModel, isOledDark = isOledDark, onToggleTheme = { isOledDark = !isOledDark; themePrefs.edit().putBoolean("dark", isOledDark).apply() })
             }
         }
     }
@@ -548,7 +595,7 @@ fun SystemBarsAndWakeEffect(immersiveFullScreen: Boolean, keepScreenOn: Boolean,
     }
 }
 
-enum class ScreenState { HOME, FOCUS, ARCHIVE }
+enum class ScreenState { HOME, FOCUS, ARCHIVE, SETTINGS }
 
 @Composable
 fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: () -> Unit) {
@@ -568,6 +615,8 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
 
     val activeQueue by viewModel.activeQueue.collectAsState()
     val todayList by viewModel.todayList.collectAsState()
+    // What next/previous walks through: open tasks plus the separators between them, so focus always pauses at a separator.
+    val focusSeq = todayList.filter { it.isSeparator || !it.isCompleted }
     val focusIndex = activeQueue.indexOfFirst { it.id == focusedId }
     // Looked up by id so a task rolled from the cleaning bank can be focused even though it is not in the current list.
     val focusFlow = remember(focusedId) { focusedId?.let { viewModel.taskFlow(it) } ?: kotlinx.coroutines.flow.flowOf<TaskEntity?>(null) }
@@ -582,6 +631,43 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
     val playlist by viewModel.playlist.collectAsState()
     val uiPrefs = remember { appContext.getSharedPreferences("mono_prefs", Context.MODE_PRIVATE) }
     var soundOn by remember { mutableStateOf(uiPrefs.getBoolean("sounds", true).also { Sfx.enabled = it }) }
+    var hapticsOn by remember { mutableStateOf(uiPrefs.getBoolean("haptics", true).also { Haptics.enabled = it }) }
+    var autoNext by remember { mutableStateOf(uiPrefs.getBoolean("auto_next", true)) }
+    var stopAtSep by remember { mutableStateOf(uiPrefs.getBoolean("stop_at_separator", true)) }
+    var morningMin by remember { mutableIntStateOf(resetMinutes(appContext, "morning")) }
+    var nightMin by remember { mutableIntStateOf(resetMinutes(appContext, "night")) }
+    var importPending by remember { mutableStateOf<Backup.Parsed?>(null) }
+    var confirmReplace by remember { mutableStateOf(false) }
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+        if (uri != null) appScope.launch {
+            val ok = try {
+                val text = viewModel.exportText(linkedMapOf(
+                    "morning_reset_minutes" to morningMin.toString(), "night_reset_minutes" to nightMin.toString(),
+                    "auto_next" to autoNext.toString(), "stop_at_separator" to stopAtSep.toString(),
+                    "sound" to soundOn.toString(), "haptics" to hapticsOn.toString(), "theme" to (if (isOledDark) "dark" else "light")
+                ))
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { appContext.contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) } }
+                true
+            } catch (e: Exception) { false }
+            Toast.makeText(appContext, if (ok) "Backup saved." else "Could not save the backup.", Toast.LENGTH_SHORT).show()
+        }
+    }
+    fun applyImportedSettings(m: Map<String, String>) {
+        m["morning_reset_minutes"]?.toIntOrNull()?.let { morningMin = it; setResetMinutes(appContext, "morning", it) }
+        m["night_reset_minutes"]?.toIntOrNull()?.let { nightMin = it; setResetMinutes(appContext, "night", it) }
+        m["auto_next"]?.toBooleanStrictOrNull()?.let { autoNext = it; uiPrefs.edit().putBoolean("auto_next", it).apply() }
+        m["stop_at_separator"]?.toBooleanStrictOrNull()?.let { stopAtSep = it; uiPrefs.edit().putBoolean("stop_at_separator", it).apply() }
+        m["sound"]?.toBooleanStrictOrNull()?.let { soundOn = it; Sfx.enabled = it; uiPrefs.edit().putBoolean("sounds", it).apply() }
+        m["haptics"]?.toBooleanStrictOrNull()?.let { hapticsOn = it; Haptics.enabled = it; uiPrefs.edit().putBoolean("haptics", it).apply() }
+        m["theme"]?.let { if ((it == "dark") != isOledDark) onToggleTheme() }
+    }
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) appScope.launch {
+            val text = try { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { appContext.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } } } catch (e: Exception) { null }
+            val parsed = text?.let { Backup.parse(it) }
+            if (parsed == null) Toast.makeText(appContext, "That file is not a MONO backup.", Toast.LENGTH_LONG).show() else importPending = parsed
+        }
+    }
 
     // Switching lists: a soft bright wash spreads from the tapped button, the list swaps underneath, then the wash fades out.
     val washReveal = remember { Animatable(0f) }
@@ -624,6 +710,8 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
         }
     }
     LaunchedEffect(activeQueue) { updateAllWidgets(appContext) }
+    // Morning clears at midnight and Night at 6 am (local time), whether the app was open or not.
+    LaunchedEffect(Unit) { while (true) { applyDailyResets(appContext); delay(30_000) } }
 
     fun rollDice(avoid: Long?) {
         appScope.launch {
@@ -659,16 +747,21 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                 return@launch
             }
             val idx = activeQueue.indexOfFirst { it.id == task.id }
-            val next = (activeQueue.getOrNull(idx + 1) ?: activeQueue.getOrNull(idx - 1))?.takeIf { it.id != task.id }
+            // The very next thing in the list, even if it is a separator: focus always pauses there.
+            // Unless Settings says otherwise: with "stop at separators" off, auto-start skips over them.
+            val following = focusSeq.drop(focusSeq.indexOfFirst { it.id == task.id } + 1)
+            val after = if (stopAtSep) following.firstOrNull() else following.firstOrNull { !it.isSeparator }
+            val next = (after ?: activeQueue.getOrNull(idx - 1))?.takeIf { it.id != task.id }
             viewModel.completeTask(task)
             pendingUndo = task
             returnId = null
-            focusedId = next?.id
+            focusedId = if (autoNext && next?.isSeparator != true) next?.id else null
             screen = ScreenState.HOME
             delay(1600)
             winVisible = false
             delay(650) // let the list show for a beat, with the finished task dimmed in place
-            autoSelectId = next?.id
+            if (!autoNext) { /* back on the list; nothing opens by itself */ }
+            else if (next?.isSeparator != true) autoSelectId = next?.id
             delay(20000)
             if (pendingUndo?.id == task.id) pendingUndo = null
         }
@@ -728,43 +821,92 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
         ) { target ->
             when (target) {
                 ScreenState.HOME -> HomeScreen(
-                    tasks = todayList, subtasksByTask = subtasksByTask, editor = editor, isDark = isOledDark, onToggleTheme = onToggleTheme,
+                    tasks = todayList, subtasksByTask = subtasksByTask, editor = editor,
                     onAddTasks = { viewModel.addTasks(it, "") },
                     onComplete = viewModel::completeTask, onUndoComplete = viewModel::undoCompleteTask, onArchiveTask = viewModel::archiveTask,
                     onReorder = viewModel::reorder,
                     onSelect = { t, y -> diceSession = false; focusedId = t.id; focusTitleY = y; returnId = null; autoSelectId = null; screen = ScreenState.FOCUS },
                     autoSelectId = autoSelectId,
-                    onOpenArchive = { returnId = null; screen = ScreenState.ARCHIVE },
+                    onOpenSettings = { returnId = null; screen = ScreenState.SETTINGS },
                     onArchiveAll = viewModel::archiveAll,
+                    onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
                     playlist = playlist, onPlaylist = { k, c -> switchPlaylist(k, c) },
                     onRoll = { rollDice(null) },
                     onCleaningToggle = { c -> switchPlaylist(if (playlist == "cleaning") "main" else "cleaning", c) },
-                    soundOn = soundOn,
-                    onToggleSound = { soundOn = !soundOn; Sfx.enabled = soundOn; uiPrefs.edit().putBoolean("sounds", soundOn).apply(); Sfx.play(Sound.TICK) },
                     returnId = returnId, returnY = focusTitleY, onReturnConsumed = { returnId = null }
                 )
                 ScreenState.FOCUS -> FocusScreen(
-                    task = focusTask, position = focusIndex + 1, titleY = focusTitleY, subtasksByTask = subtasksByTask, editor = editor, onFocusSession = viewModel::addFocusSession, remainingCount = if (diceSession) 2 else activeQueue.size, diceMode = diceSession, morphFromList = !diceSession, keepScreenOn = keepScreenOn,
+                    task = focusTask, position = focusIndex + 1, titleY = focusTitleY, subtasksByTask = subtasksByTask, editor = editor, onFocusSession = viewModel::addFocusSession, remainingCount = if (diceSession) 2 else focusSeq.size, diceMode = diceSession, morphFromList = !diceSession, keepScreenOn = keepScreenOn,
                     onToggleKeepScreenOn = { toggleKeepAwake() },
                     onFinish = { t, c -> finishTask(t, c) },
                     undoTask = pendingUndo,
                     onUndo = { t -> viewModel.undoCompleteTask(t); focusedId = t.id; pendingUndo = null },
                     onUndoDismiss = { pendingUndo = null },
+                    onMoveToPrev = { t ->
+                        val idx = focusSeq.indexOfFirst { it.id == t.id }
+                        if (focusSeq.size > 1) {
+                            val target = focusSeq[(idx - 1 + focusSeq.size) % focusSeq.size]
+                            // A separator is where single-task focus ends: go back to the list.
+                            if (target.isSeparator) { returnId = t.id; diceSession = false; screen = ScreenState.HOME } else focusedId = target.id
+                        }
+                    },
                     onMoveToNext = { t ->
                         if (diceSession) rollDice(t.id)
                         else {
-                            val idx = activeQueue.indexOfFirst { it.id == t.id }
-                            if (activeQueue.size > 1) focusedId = activeQueue[(idx + 1) % activeQueue.size].id
+                            val idx = focusSeq.indexOfFirst { it.id == t.id }
+                            if (focusSeq.size > 1) {
+                                val target = focusSeq[(idx + 1) % focusSeq.size]
+                                if (target.isSeparator) { returnId = t.id; diceSession = false; screen = ScreenState.HOME } else focusedId = target.id
+                            }
                         }
                     },
                     onExitFocus = { returnId = if (diceSession) null else focusTask?.id; diceSession = false; screen = ScreenState.HOME }
                 )
                 ScreenState.ARCHIVE -> ArchiveScreen(
-                    archivedTasks = archivedTasks, onRestore = viewModel::undoCompleteTask, onClearArchive = viewModel::clearArchive, onBack = { screen = ScreenState.HOME }
+                    archivedTasks = archivedTasks, onRestore = viewModel::undoCompleteTask, onClearArchive = viewModel::clearArchive, onBack = { screen = ScreenState.SETTINGS }
+                )
+                ScreenState.SETTINGS -> SettingsScreen(
+                    archivedCount = archivedTasks.size, onOpenArchive = { screen = ScreenState.ARCHIVE },
+                    morningMin = morningMin, nightMin = nightMin,
+                    onMorningMin = { morningMin = it; setResetMinutes(appContext, "morning", it) },
+                    onNightMin = { nightMin = it; setResetMinutes(appContext, "night", it) },
+                    autoNext = autoNext, onAutoNext = { autoNext = it; uiPrefs.edit().putBoolean("auto_next", it).apply() },
+                    stopAtSep = stopAtSep, onStopAtSep = { stopAtSep = it; uiPrefs.edit().putBoolean("stop_at_separator", it).apply() },
+                    soundOn = soundOn, onSound = { soundOn = it; Sfx.enabled = it; uiPrefs.edit().putBoolean("sounds", it).apply(); if (it) Sfx.play(Sound.TICK) },
+                    hapticsOn = hapticsOn, onHaptics = { hapticsOn = it; Haptics.enabled = it; uiPrefs.edit().putBoolean("haptics", it).apply(); if (it) triggerHaptic(appContext, HapticStyle.TICK) },
+                    isDark = isOledDark, onDark = { if (it != isOledDark) onToggleTheme() },
+                    onExport = { exportLauncher.launch("mono-backup-" + java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date()) + ".txt") },
+                    onImport = { importLauncher.launch(arrayOf("text/plain", "application/octet-stream")) },
+                    onBack = { screen = ScreenState.HOME }
                 )
             }
         }
         DoneOverlay(visible = winVisible, center = winCenter)
+        importPending?.let { p ->
+            if (!confirmReplace) AlertDialog(
+                onDismissRequest = { importPending = null }, containerColor = MaterialTheme.colorScheme.surface,
+                title = { Text("Import backup") },
+                text = { Text("${p.real} tasks, ${p.separators} separators, ${p.archived} archived, and ${p.settings.size} settings.\n\nAdd them to the end of your lists, or overwrite your lists with them. Settings are restored either way.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        importPending = null
+                        appScope.launch { applyImportedSettings(p.settings); val a = viewModel.importAdd(p); Toast.makeText(appContext, "Added $a items to the end of your lists.", Toast.LENGTH_LONG).show() }
+                    }) { Text("Add to the end", color = MaterialTheme.colorScheme.primary) }
+                },
+                dismissButton = { TextButton(onClick = { confirmReplace = true }) { Text("Overwrite lists", color = MaterialTheme.colorScheme.onSurfaceVariant) } }
+            ) else AlertDialog(
+                onDismissRequest = { confirmReplace = false; importPending = null }, containerColor = MaterialTheme.colorScheme.surface,
+                title = { Text("Overwrite your lists?") },
+                text = { Text("This deletes every task in MONO right now and puts the backup in their place. It cannot be undone.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        confirmReplace = false; importPending = null
+                        appScope.launch { applyImportedSettings(p.settings); viewModel.importReplace(p); Toast.makeText(appContext, "Lists overwritten from the backup.", Toast.LENGTH_LONG).show() }
+                    }) { Text("Overwrite", color = MaterialTheme.colorScheme.primary) }
+                },
+                dismissButton = { TextButton(onClick = { confirmReplace = false; importPending = null }) { Text("Cancel", color = MaterialTheme.colorScheme.onSurfaceVariant) } }
+            )
+        }
       }
     }
     }
@@ -832,10 +974,11 @@ fun DoneOverlay(visible: Boolean, center: Offset) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun HomeScreen(
-    tasks: List<TaskEntity>, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions, isDark: Boolean, onToggleTheme: () -> Unit,
+    tasks: List<TaskEntity>, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions,
     onAddTasks: (String) -> Unit, onComplete: (TaskEntity) -> Unit, onUndoComplete: (TaskEntity) -> Unit,
-    onReorder: (List<TaskEntity>) -> Unit, onSelect: (TaskEntity, Float) -> Unit, onOpenArchive: () -> Unit, onArchiveAll: () -> Unit, onArchiveTask: (TaskEntity) -> Unit,
-    playlist: String, onPlaylist: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit, soundOn: Boolean, onToggleSound: () -> Unit,
+    onReorder: (List<TaskEntity>) -> Unit, onSelect: (TaskEntity, Float) -> Unit, onOpenSettings: () -> Unit, onArchiveAll: () -> Unit, onArchiveTask: (TaskEntity) -> Unit,
+    onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
+    playlist: String, onPlaylist: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit,
     autoSelectId: Long?, returnId: Long?, returnY: Float, onReturnConsumed: () -> Unit
 ) {
     val context = LocalContext.current
@@ -855,6 +998,8 @@ fun HomeScreen(
     LaunchedEffect(Unit) { if (returnId != null) { selectingId = null; onReturnConsumed() } }
     val chromeAlpha by animateFloatAsState(if (selectingId != null) 0f else 1f, tween(440, easing = FastOutSlowInEasing), label = "chrome")
     var editingId by remember { mutableStateOf<Long?>(null) }
+    var confirmArchiveAll by remember { mutableStateOf(false) }
+    var editingSeparator by remember { mutableStateOf<TaskEntity?>(null) }
 
     // Local copy of the list so drag-to-reorder is instant; written back on drop.
     val items = remember { mutableStateListOf<TaskEntity>().apply { addAll(tasks) } }
@@ -867,6 +1012,43 @@ fun HomeScreen(
         if (autoSelectId != null) {
             val i = items.indexOfFirst { it.id == autoSelectId }
             if (i >= 0 && listState.layoutInfo.visibleItemsInfo.none { it.key == autoSelectId }) listState.scrollToItem(i)
+        }
+    }
+
+    // Pull the list down from the top to open Settings. A gear fades in as you pull and clicks in when you can let go.
+    var pull by remember { mutableFloatStateOf(0f) }
+    val pullThreshold = remember(density) { with(density) { 90.dp.toPx() } }
+    var pullArmed by remember { mutableStateOf(false) }
+    val pullConnection = remember(listState, pullThreshold) {
+        object : androidx.compose.ui.input.nestedscroll.NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: androidx.compose.ui.input.nestedscroll.NestedScrollSource): Offset {
+                if (pull > 0f && available.y < 0f && source == androidx.compose.ui.input.nestedscroll.NestedScrollSource.Drag) {
+                    val next = (pull + available.y).coerceAtLeast(0f)
+                    val used = next - pull
+                    pull = next
+                    pullArmed = pull >= pullThreshold
+                    return Offset(0f, used)
+                }
+                return Offset.Zero
+            }
+            override fun onPostScroll(consumed: Offset, available: Offset, source: androidx.compose.ui.input.nestedscroll.NestedScrollSource): Offset {
+                if (source == androidx.compose.ui.input.nestedscroll.NestedScrollSource.Drag && available.y > 0f && !listState.canScrollBackward && selectingId == null && draggingId == null) {
+                    pull = (pull + available.y * 0.5f).coerceAtMost(pullThreshold * 1.5f)
+                    val armed = pull >= pullThreshold
+                    if (armed && !pullArmed) triggerHaptic(context, HapticStyle.CONFIRM)
+                    pullArmed = armed
+                    return Offset(0f, available.y)
+                }
+                return Offset.Zero
+            }
+            override suspend fun onPreFling(available: androidx.compose.ui.unit.Velocity): androidx.compose.ui.unit.Velocity {
+                if (pull <= 0f) return androidx.compose.ui.unit.Velocity.Zero
+                val open = pull >= pullThreshold
+                if (open) { Sfx.play(Sound.TICK); onOpenSettings() }
+                pullArmed = false
+                animate(pull, 0f, animationSpec = tween(240, easing = FastOutSlowInEasing)) { v, _ -> pull = v }
+                return available
+            }
         }
     }
 
@@ -892,7 +1074,7 @@ fun HomeScreen(
                     IconButton(onClick = {
                         triggerHaptic(context, HapticStyle.TICK)
                         // Shrink back to this list's own button (Morning sits left of centre, Night/Cleaning right).
-                        val dx = with(density) { 19.dp.toPx() } * (if (playlist == "morning") -1 else 1)
+                        val dx = with(density) { 24.dp.toPx() } *(if (playlist == "morning") -1 else 1)
                         onPlaylist("main", glyphRowCenter + Offset(dx, 0f))
                     }) { Icon(Icons.Outlined.ArrowBackIosNew, contentDescription = "Back to main list", tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f), modifier = Modifier.size(17.dp)) }
                     Text(
@@ -903,28 +1085,92 @@ fun HomeScreen(
                 }
             }
             Row {
-                IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.SWEEP); onArchiveAll() }, enabled = items.isNotEmpty() && selectingId == null, modifier = Modifier.size(38.dp)) {
+                IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); confirmArchiveAll = true }, enabled = items.any { !it.isSeparator } && selectingId == null, modifier = Modifier.size(38.dp)) {
                     Icon(Icons.Outlined.MoveToInbox, contentDescription = "Archive all", tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (items.isNotEmpty()) 0.6f else 0.25f), modifier = Modifier.size(19.dp))
                 }
-                IconButton(onClick = onOpenArchive, modifier = Modifier.size(38.dp)) { Icon(Icons.Outlined.Inventory2, contentDescription = "Archive", tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f), modifier = Modifier.size(19.dp)) }
-                IconButton(onClick = onToggleSound, modifier = Modifier.size(38.dp)) { Icon(if (soundOn) Icons.Outlined.VolumeUp else Icons.Outlined.VolumeOff, contentDescription = if (soundOn) "Sounds on" else "Sounds off", tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f), modifier = Modifier.size(19.dp)) }
-                IconButton(onClick = onToggleTheme, modifier = Modifier.size(38.dp)) { Icon(if (isDark) Icons.Outlined.LightMode else Icons.Outlined.DarkMode, contentDescription = "Theme", tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f), modifier = Modifier.size(19.dp)) }
             }
         }
 
-        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+        Box(modifier = Modifier.weight(1f).fillMaxWidth().nestedScroll(pullConnection)) {
+            // The gear that rises out of the top edge while you pull.
+            val reveal = (pull / pullThreshold).coerceIn(0f, 1f)
+            if (reveal > 0.02f) Box(
+                Modifier.align(Alignment.TopCenter).graphicsLayer { translationY = pull * 0.45f - 6f; alpha = reveal },
+                contentAlignment = Alignment.Center
+            ) {
+                Row(
+                    Modifier.width(132.dp).height(36.dp),
+                    horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        Icons.Outlined.Settings, contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurface.copy(alpha = if (pullArmed) 0.85f else 0.55f),
+                        modifier = Modifier.size(17.dp).graphicsLayer { rotationZ = reveal * 120f }
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Settings", style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.2.sp), color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (pullArmed) 0.85f else 0.55f))
+                }
+            }
             if (items.isEmpty()) {
                 Text(if (playlist == "cleaning") "Add tiny 2-minute cleans here." else "Nothing to do.", modifier = Modifier.align(Alignment.Center), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { translationY = pull }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
                 items(items, key = { it.id }) { task ->
                     val isDragging = draggingId == task.id
-                    TaskRow(
+                    val rowModifier = if (isDragging || selectingId == task.id) Modifier.zIndex(1f) else Modifier.animateItemPlacement()
+                    val dragTranslation = {
+                        val info = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == task.id }
+                        if (info == null) dragDelta else dragDelta - (info.offset - dragStartOffset)
+                    }
+                    val onDragStartRow = {
+                        triggerHaptic(context, HapticStyle.TICK)
+                        focusManager.clearFocus()
+                        draggingId = task.id
+                        dragDelta = 0f
+                        dragStartOffset = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == task.id }?.offset ?: 0
+                    }
+                    val onDragRow = { dy: Float ->
+                        dragDelta += dy
+                        val info = listState.layoutInfo
+                        val me = info.visibleItemsInfo.firstOrNull { it.key == task.id }
+                        if (me != null) {
+                            val center = dragStartOffset + dragDelta + me.size / 2f
+                            // Swap only when the dragged edge passes the neighbour's midpoint, so rows of different heights never fight each other.
+                            val top = dragStartOffset + dragDelta
+                            val bottom = top + me.size
+                            val below = info.visibleItemsInfo.firstOrNull { it.index == me.index + 1 }
+                            val above = info.visibleItemsInfo.firstOrNull { it.index == me.index - 1 }
+                            val target = if (below != null && bottom > below.offset + below.size / 2f) below
+                                else if (above != null && top < above.offset + above.size / 2f) above else null
+                            if (target != null) {
+                                val from = items.indexOfFirst { it.id == task.id }
+                                val to = target.index
+                                if (from >= 0 && to >= 0 && to < items.size && to != from) {
+                                    items.add(to, items.removeAt(from))
+                                    triggerHaptic(context, HapticStyle.TICK)
+                                }
+                            }
+                            if (center < info.viewportStartOffset + 90f) scope.launch { listState.scrollBy(-24f) }
+                            else if (center > info.viewportEndOffset - 90f) scope.launch { listState.scrollBy(24f) }
+                        }
+                    }
+                    val onDragEndRow = {
+                        draggingId = null
+                        dragDelta = 0f
+                        onReorder(items.toList())
+                    }
+                    if (task.isSeparator) {
+                        SeparatorRow(
+                            task = task, isDragging = isDragging, modifier = rowModifier, hidden = selectingId != null,
+                            dragTranslation = dragTranslation, onEdit = { editingSeparator = task }, onDelete = { onDeleteSeparator(task) },
+                            onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
+                        )
+                    } else TaskRow(
                         task = task,
                         subtasks = subtasksByTask[task.id].orEmpty(),
                         onOpen = { if (selectingId == null) { triggerHaptic(context, HapticStyle.TICK); editingId = task.id } },
                         isDragging = isDragging,
-                        modifier = if (isDragging || selectingId == task.id) Modifier.zIndex(1f) else Modifier.animateItemPlacement(),
+                        modifier = rowModifier,
                         selection = when (selectingId) { null -> 0; task.id -> 2; else -> 1 },
                         focusX = focusX, minY = minY, maxY = maxY, morphY = morphY,
                         autoSelect = autoSelectId == task.id,
@@ -938,43 +1184,10 @@ fun HomeScreen(
                                 onSelect(task, y)
                             }
                         },
-                        dragTranslation = {
-                            val info = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == task.id }
-                            if (info == null) dragDelta else dragDelta - (info.offset - dragStartOffset)
-                        },
+                        dragTranslation = dragTranslation,
                         onCheck = { if (task.isCompleted) onUndoComplete(task) else onComplete(task) },
                         onArchive = { onArchiveTask(task) },
-                        onDragStart = {
-                            triggerHaptic(context, HapticStyle.TICK)
-                            focusManager.clearFocus()
-                            draggingId = task.id
-                            dragDelta = 0f
-                            dragStartOffset = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == task.id }?.offset ?: 0
-                        },
-                        onDrag = { dy ->
-                            dragDelta += dy
-                            val info = listState.layoutInfo
-                            val me = info.visibleItemsInfo.firstOrNull { it.key == task.id }
-                            if (me != null) {
-                                val center = dragStartOffset + dragDelta + me.size / 2f
-                                val target = info.visibleItemsInfo.firstOrNull { it.key != task.id && it.key is Long && center >= it.offset && center < it.offset + it.size }
-                                if (target != null) {
-                                    val from = items.indexOfFirst { it.id == task.id }
-                                    val to = target.index
-                                    if (from >= 0 && to >= 0 && to < items.size && to != from) {
-                                        items.add(to, items.removeAt(from))
-                                        triggerHaptic(context, HapticStyle.TICK)
-                                    }
-                                }
-                                if (center < info.viewportStartOffset + 90f) scope.launch { listState.scrollBy(-24f) }
-                                else if (center > info.viewportEndOffset - 90f) scope.launch { listState.scrollBy(24f) }
-                            }
-                        },
-                        onDragEnd = {
-                            draggingId = null
-                            dragDelta = 0f
-                            onReorder(items.toList())
-                        }
+                        onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
                     )
                 }
             }
@@ -983,11 +1196,11 @@ fun HomeScreen(
         Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = chromeAlpha }.navigationBarsPadding().imePadding().padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 8.dp)) {
             // One shape, one outline: the bar with a raised centre tab that holds the list buttons. The tab sits above the text area, never over it.
             val dockDensity = LocalDensity.current
-            val dockShape = remember(dockDensity) { DockShape(with(dockDensity) { 104.dp.toPx() }, with(dockDensity) { 38.dp.toPx() }, with(dockDensity) { 28.dp.toPx() }, with(dockDensity) { 19.dp.toPx() }) }
+            val dockShape = remember(dockDensity) { DockShape(with(dockDensity) { 116.dp.toPx() }, with(dockDensity) { 48.dp.toPx() }, with(dockDensity) { 22.dp.toPx() }, with(dockDensity) { 22.dp.toPx() }) }
             Column(Modifier.fillMaxWidth().clip(dockShape).background(MaterialTheme.colorScheme.surface).border(1.dp, MaterialTheme.colorScheme.outline, dockShape)) {
-                Box(Modifier.fillMaxWidth().height(38.dp), contentAlignment = Alignment.Center) {
+                Box(Modifier.fillMaxWidth().height(48.dp), contentAlignment = Alignment.Center) {
                     // Hairline between the list buttons and the text bar, across the tab only.
-                    Box(Modifier.align(Alignment.BottomCenter).width(88.dp).height(1.dp).background(MaterialTheme.colorScheme.outline.copy(alpha = 0.7f)))
+                    Box(Modifier.align(Alignment.BottomCenter).width(92.dp).height(1.dp).background(MaterialTheme.colorScheme.outline.copy(alpha = 0.7f)))
                     Row(
                         Modifier.onGloballyPositioned { glyphRowCenter = it.positionInRoot() + Offset(it.size.width / 2f, it.size.height / 2f) },
                         verticalAlignment = Alignment.CenterVertically
@@ -1019,13 +1232,25 @@ fun HomeScreen(
                     }
                 )
                 val canAdd = input.isNotBlank()
+                val btnShape = RoundedCornerShape(14.dp)
+                // Adds a divider line; anything typed becomes its label.
                 Box(
-                    modifier = Modifier.size(40.dp).clip(CircleShape)
-                        .background(if (canAdd) MaterialTheme.colorScheme.primary else Color.Transparent)
-                        .clickable(enabled = canAdd) { submit() },
+                    modifier = Modifier.size(40.dp).clip(btnShape).clickable {
+                        triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.ADD)
+                        onAddSeparator(input.trim()); input = ""
+                    },
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Outlined.Add, contentDescription = "Add", modifier = Modifier.size(22.dp), tint = if (canAdd) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f))
+                    Icon(Icons.Outlined.HorizontalRule, contentDescription = "Add a separator", modifier = Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f))
+                }
+                // The + only exists while there is something to add.
+                AnimatedVisibility(visible = canAdd, enter = fadeIn(tween(160)) + scaleIn(tween(160), initialScale = 0.7f), exit = fadeOut(tween(120)) + scaleOut(tween(120), targetScale = 0.7f)) {
+                    Box(
+                        modifier = Modifier.padding(start = 4.dp).size(40.dp).clip(btnShape).background(MaterialTheme.colorScheme.primary).clickable { submit() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Outlined.Add, contentDescription = "Add", modifier = Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onPrimary)
+                    }
                 }
             }
             }
@@ -1035,7 +1260,159 @@ fun HomeScreen(
     items.firstOrNull { it.id == editingId }?.let { t ->
         TaskEditorSheet(task = t, subtasks = subtasksByTask[t.id].orEmpty(), actions = editor, onClose = { editingId = null })
     }
+
+    if (confirmArchiveAll) {
+        val n = items.count { !it.isSeparator }
+        AlertDialog(
+            onDismissRequest = { confirmArchiveAll = false },
+            containerColor = MaterialTheme.colorScheme.surface,
+            title = { Text("Archive everything?") },
+            text = { Text("This moves all $n ${if (n == 1) "task" else "tasks"} on this list to the archive. You can send them back from there.") },
+            confirmButton = {
+                TextButton(onClick = { confirmArchiveAll = false; triggerHaptic(context, HapticStyle.CONFIRM); Sfx.play(Sound.SWEEP); onArchiveAll() }) { Text("Archive all", color = MaterialTheme.colorScheme.primary) }
+            },
+            dismissButton = { TextButton(onClick = { confirmArchiveAll = false }) { Text("Cancel", color = MaterialTheme.colorScheme.onSurfaceVariant) } }
+        )
+    }
+
+    editingSeparator?.let { sep ->
+        SeparatorEditorSheet(
+            task = sep,
+            onSave = { onLabelSeparator(sep, it) },
+            onRemove = { onDeleteSeparator(sep) },
+            onClose = { editingSeparator = null }
+        )
+    }
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SeparatorEditorSheet(task: TaskEntity, onSave: (String) -> Unit, onRemove: () -> Unit, onClose: () -> Unit) {
+    var v by remember(task.id) { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(task.title)) }
+    var focused by remember { mutableStateOf(false) }
+    var removed by remember { mutableStateOf(false) }
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val primary = MaterialTheme.colorScheme.primary
+    val close = { if (!removed) onSave(v.text); onClose() }
+    InWindowSheet(onDismiss = close) {
+        Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
+            BasicTextField(
+                value = v, onValueChange = { v = it }, singleLine = true,
+                textStyle = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface),
+                cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused },
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                decorationBox = { inner ->
+                    Box {
+                        if (v.text.isEmpty()) Text("Separator label (optional)", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold), color = muted.copy(alpha = 0.5f))
+                        inner()
+                    }
+                }
+            )
+            Spacer(Modifier.height(20.dp))
+            Box(Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.colorScheme.outline))
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp).clip(RoundedCornerShape(12.dp)).clickable { removed = true; onRemove(); onClose() }.padding(vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Outlined.Delete, contentDescription = null, tint = muted, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(14.dp))
+                Text("Remove separator", style = MaterialTheme.typography.bodyLarge, color = muted)
+            }
+        }
+    }
+}
+
+/** A divider line with an optional label. Hold it to move it, tap to rename, swipe left to take it away. */
+@Composable
+fun SeparatorRow(
+    task: TaskEntity, isDragging: Boolean, hidden: Boolean, modifier: Modifier, dragTranslation: () -> Float,
+    onEdit: () -> Unit, onDelete: () -> Unit, onDragStart: () -> Unit, onDrag: (Float) -> Unit, onDragEnd: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val outline = MaterialTheme.colorScheme.outline
+    val shape = RoundedCornerShape(16.dp)
+    val alpha by animateFloatAsState(if (hidden) 0f else 1f, tween(440, easing = FastOutSlowInEasing), label = "sepAlpha")
+    val swipe = remember { Animatable(0f) }
+    val threshold = with(LocalDensity.current) { 110.dp.toPx() }
+    Row(
+        modifier = modifier.fillMaxWidth()
+            // Hold anywhere on it to pick it up and move it.
+            .pointerInput(task.id) {
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { triggerHaptic(context, HapticStyle.TICK); onDragStart() },
+                    onDrag = { change, amount -> change.consume(); onDrag(amount.y) },
+                    onDragEnd = { onDragEnd() },
+                    onDragCancel = { onDragEnd() }
+                )
+            }
+            .pointerInput(task.id) {
+                detectHorizontalDragGestures(
+                    onDragEnd = {
+                        scope.launch {
+                            if (swipe.value < -threshold) {
+                                triggerHaptic(context, HapticStyle.CONFIRM)
+                                swipe.animateTo(-size.width.toFloat(), tween(260, easing = FastOutSlowInEasing))
+                                onDelete()
+                            } else swipe.animateTo(0f, tween(200))
+                        }
+                    },
+                    onDragCancel = { scope.launch { swipe.animateTo(0f, tween(200)) } },
+                    onHorizontalDrag = { change, delta -> change.consume(); scope.launch { swipe.snapTo((swipe.value + delta).coerceAtMost(0f)) } }
+                )
+            }
+            .graphicsLayer { translationX = swipe.value; translationY = if (isDragging) dragTranslation() else 0f; this.alpha = alpha * (1f + swipe.value / (size.width.coerceAtLeast(1f))).coerceIn(0f, 1f) }
+            .then(if (isDragging) Modifier.shadow(12.dp, shape).background(MaterialTheme.colorScheme.surface, shape) else Modifier),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            modifier = Modifier.weight(1f).height(44.dp).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onEdit() }.padding(start = 20.dp, end = 14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (task.title.isNotBlank()) {
+                Text(task.title.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.6.sp, fontWeight = FontWeight.Medium), color = muted.copy(alpha = 0.75f), modifier = Modifier.widthIn(max = 240.dp))
+                Spacer(Modifier.width(12.dp))
+            }
+            Box(Modifier.weight(1f).height(1.dp).background(outline))
+        }
+    }
+}
+
+/**
+ * A bottom sheet drawn inside the app's own window instead of a separate dialog window.
+ * Android's native Cut/Copy/Paste pop-up is hidden in dialog windows, but works here exactly as it does in the add bar.
+ */
+@Composable
+fun InWindowSheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+    var shown by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) { shown = true }
+    val dismiss: () -> Unit = { scope.launch { shown = false; delay(220); onDismiss() } }
+    BackHandler(onBack = dismiss)
+    Box(Modifier.fillMaxSize()) {
+        AnimatedVisibility(shown, enter = fadeIn(tween(220)), exit = fadeOut(tween(200))) {
+            Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.7f)).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { dismiss() })
+        }
+        AnimatedVisibility(
+            shown, modifier = Modifier.align(Alignment.BottomCenter),
+            enter = slideInVertically(tween(260, easing = FastOutSlowInEasing)) { it }, exit = slideOutVertically(tween(200, easing = FastOutSlowInEasing)) { it }
+        ) {
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)).background(MaterialTheme.colorScheme.surface)
+                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { }
+            ) {
+                Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.Center) {
+                    Box(Modifier.width(32.dp).height(4.dp).clip(CircleShape).background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)))
+                }
+                content()
+            }
+        }
+    }
+}
+
+/** The rounded square every check box uses, the same family as the big yellow check button. */
+val CheckShape = RoundedCornerShape(7.dp)
 
 /** Left edge of the focus screen's title. Its vertical position is wherever the tapped task's title was on screen. */
 val FOCUS_TITLE_X = 28.dp
@@ -1125,9 +1502,7 @@ fun TaskRow(
                 }
             }
             .graphicsLayer { translationX = swipe.value; translationY = if (isDragging) dragTranslation() else 0f; alpha = rowAlpha * (1f - archivePop.value * 0.85f) * (1f - (-swipe.value / (size.width.coerceAtLeast(1f))).coerceIn(0f, 1f) * 0.5f) }
-            .then(if (isDragging) Modifier.shadow(12.dp, shape).background(surface, shape) else Modifier.drawBehind {
-                drawLine(outline.copy(alpha = 0.6f * partsAlpha), Offset(16.dp.toPx(), size.height), Offset(size.width - 16.dp.toPx(), size.height), 1.dp.toPx())
-            })
+            .then(if (isDragging) Modifier.shadow(12.dp, shape).background(surface, shape) else Modifier)
             .padding(start = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -1140,9 +1515,9 @@ fun TaskRow(
             contentAlignment = Alignment.Center
         ) {
             Box(
-                modifier = Modifier.size(22.dp).clip(CircleShape)
+                modifier = Modifier.size(22.dp).clip(CheckShape)
                     .background(if (checked) muted.copy(alpha = 0.35f) else Color.Transparent)
-                    .then(if (checked) Modifier else Modifier.border(1.5.dp, muted.copy(alpha = 0.6f), CircleShape)),
+                    .then(if (checked) Modifier else Modifier.border(1.5.dp, muted.copy(alpha = 0.6f), CheckShape)),
                 contentAlignment = Alignment.Center
             ) {
                 if (checked) Icon(Icons.Default.Check, contentDescription = "Completed. Tap to undo", tint = MaterialTheme.colorScheme.background, modifier = Modifier.size(14.dp))
@@ -1197,7 +1572,7 @@ fun TaskRow(
 @Composable
 fun FocusScreen(
     task: TaskEntity?, position: Int, titleY: Float, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions, onFocusSession: (Long) -> Unit, remainingCount: Int, diceMode: Boolean, morphFromList: Boolean, keepScreenOn: Boolean, onToggleKeepScreenOn: () -> Unit,
-    onFinish: (TaskEntity, Offset) -> Unit, undoTask: TaskEntity?, onUndo: (TaskEntity) -> Unit, onUndoDismiss: () -> Unit, onMoveToNext: (TaskEntity) -> Unit,
+    onFinish: (TaskEntity, Offset) -> Unit, undoTask: TaskEntity?, onUndo: (TaskEntity) -> Unit, onUndoDismiss: () -> Unit, onMoveToNext: (TaskEntity) -> Unit, onMoveToPrev: (TaskEntity) -> Unit,
     onExitFocus: () -> Unit
 ) {
     // Everything on this screen except the title fades in while the list's text grows into place; the title swaps in when it lands.
@@ -1257,6 +1632,7 @@ fun FocusScreen(
         }
     }
     var dragY by remember { mutableFloatStateOf(0f) }
+    var goingBack by remember { mutableStateOf(false) }
     val diceSpin = remember { Animatable(0f) }
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val primary = MaterialTheme.colorScheme.primary
@@ -1269,28 +1645,17 @@ fun FocusScreen(
                         detectVerticalDragGestures(
                             onDragStart = { dragY = 0f },
                             onVerticalDrag = { _, a -> dragY += a },
-                            onDragEnd = { if (dragY < -140f) { triggerHaptic(context, HapticStyle.TICK); onMoveToNext(task) } }
+                            onDragEnd = {
+                                if (dragY < -140f) { triggerHaptic(context, HapticStyle.TICK); goingBack = false; onMoveToNext(task) }
+                                else if (dragY > 140f && !diceMode) { triggerHaptic(context, HapticStyle.TICK); goingBack = true; onMoveToPrev(task) }
+                            }
                         )
                     }
                 }
         ) {
             Row(modifier = Modifier.fillMaxWidth().height(48.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick = exit) { Icon(Icons.Outlined.ArrowBack, contentDescription = "Back", tint = muted) }
-                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                    Row(
-                        modifier = Modifier.graphicsLayer { alpha = undoAlpha }.clip(CircleShape).background(MaterialTheme.colorScheme.surface)
-                            .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
-                            .clickable(enabled = undoTask != null) {
-                                undoTask?.let { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.UNDO); onUndo(it) }
-                            }
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Outlined.Undo, contentDescription = null, tint = primary, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("Undo", style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold), color = primary)
-                    }
-                }
+                Spacer(Modifier.weight(1f))
                 if (task != null) {
                     Row {
                         if (currentSubs.isNotEmpty()) {
@@ -1317,7 +1682,10 @@ fun FocusScreen(
 
             AnimatedContent(
                 targetState = task, modifier = Modifier.weight(1f).fillMaxWidth(),
-                transitionSpec = { (slideInVertically { it / 4 } + fadeIn(tween(350))).togetherWith(slideOutVertically { -it / 4 } + fadeOut(tween(250))) },
+                transitionSpec = {
+                    if (goingBack) (slideInVertically { -it / 4 } + fadeIn(tween(350))).togetherWith(slideOutVertically { it / 4 } + fadeOut(tween(250)))
+                    else (slideInVertically { it / 4 } + fadeIn(tween(350))).togetherWith(slideOutVertically { -it / 4 } + fadeOut(tween(250)))
+                },
                 contentKey = { it?.id }, label = "FocusTask"
             ) { current ->
                 // Title sits at a fixed spot (FOCUS_TITLE_X / FOCUS_TITLE_Y from the window's top-left) so the list's text can glide onto it.
@@ -1359,7 +1727,7 @@ fun FocusScreen(
                                                 modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).clickable { triggerHaptic(context, HapticStyle.CONFIRM); editor.onToggleSub(step) }.padding(vertical = 8.dp),
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
-                                                Box(Modifier.size(26.dp).clip(CircleShape).border(2.dp, primary, CircleShape))
+                                                Box(Modifier.size(26.dp).clip(CheckShape).border(2.dp, primary, CheckShape))
                                                 Spacer(Modifier.width(16.dp))
                                                 Text(step.title, style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Medium), color = MaterialTheme.colorScheme.onBackground)
                                             }
@@ -1420,7 +1788,7 @@ fun FocusScreen(
                                 delay(340)
                                 onMoveToNext(task)
                                 tumble.join()
-                            } else onMoveToNext(task)
+                            } else { goingBack = false; onMoveToNext(task) }
                         },
                         enabled = remainingCount > 1, modifier = Modifier.size(52.dp)
                     ) {
@@ -1435,6 +1803,25 @@ fun FocusScreen(
                         contentAlignment = Alignment.Center
                     ) { Icon(Icons.Outlined.ArrowBack, contentDescription = "Back to list", tint = muted) }
                 }
+            }
+        }
+
+        // Undo sits just above the check button, for a few seconds after finishing a task.
+        if (undoAlpha > 0.01f) {
+            Box(Modifier.align(Alignment.TopCenter).padding(top = (LocalConfiguration.current.screenHeightDp * 0.25f).dp)) {
+                    Row(
+                        modifier = Modifier.graphicsLayer { alpha = undoAlpha }.clip(CircleShape).background(MaterialTheme.colorScheme.surface)
+                            .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
+                            .clickable(enabled = undoTask != null) {
+                                undoTask?.let { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.UNDO); onUndo(it) }
+                            }
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Outlined.Undo, contentDescription = null, tint = primary, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Undo", style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold), color = primary)
+                    }
             }
         }
 
@@ -1541,8 +1928,8 @@ fun PlaylistGlyphs(selected: String, onSelect: (String, Offset) -> Unit, onRoll:
     val rest = if (onDayPage) ink else ElectricYellow
     // Small and close together; exactly two fit the window, the dice waits out of sight to the right.
     Row(
-        modifier = Modifier.width(70.dp).horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically
+        modifier = Modifier.width(80.dp).horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically
     ) {
         glyphs.forEach { g ->
             val isOn = selected == g.key
@@ -1669,8 +2056,8 @@ fun SubtaskList(
             key(sub.id) {
                 Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { onToggle(sub) }.padding(vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box(
-                        modifier = Modifier.size(20.dp).clip(CircleShape).background(if (sub.isDone) primary else Color.Transparent)
-                            .border(1.5.dp, if (sub.isDone) primary else muted.copy(alpha = 0.6f), CircleShape),
+                        modifier = Modifier.size(20.dp).clip(CheckShape).background(if (sub.isDone) primary else Color.Transparent)
+                            .border(1.5.dp, if (sub.isDone) primary else muted.copy(alpha = 0.6f), CheckShape),
                         contentAlignment = Alignment.Center
                     ) {
                         if (sub.isDone) Icon(Icons.Default.Check, contentDescription = null, tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(12.dp))
@@ -1710,28 +2097,28 @@ fun SubtaskList(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TaskEditorSheet(task: TaskEntity, subtasks: List<SubtaskEntity>, actions: EditorActions, onClose: () -> Unit) {
-    var title by remember(task.id) { mutableStateOf(task.title) }
-    var notes by remember(task.id) { mutableStateOf(task.notes) }
+    var titleV by remember(task.id) { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(task.title)) }
+    var notesV by remember(task.id) { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(task.notes)) }
+    val title = titleV.text
+    val notes = notesV.text
+    var focusedField by remember { mutableIntStateOf(0) } // 1 = title, 2 = notes
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val primary = MaterialTheme.colorScheme.primary
     val close = { actions.onEditTask(task, title, notes); onClose() }
 
-    ModalBottomSheet(
-        onDismissRequest = close, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-        containerColor = MaterialTheme.colorScheme.surface, tonalElevation = 0.dp, scrimColor = Color.Black.copy(alpha = 0.7f)
-    ) {
+    InWindowSheet(onDismiss = close) {
         Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
             BasicTextField(
-                value = title, onValueChange = { title = it },
+                value = titleV, onValueChange = { titleV = it },
                 textStyle = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface),
-                cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth(),
+                cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) focusedField = 1 },
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences)
             )
             Spacer(Modifier.height(10.dp))
             BasicTextField(
-                value = notes, onValueChange = { notes = it },
+                value = notesV, onValueChange = { notesV = it },
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = muted),
-                cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth(),
+                cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) focusedField = 2 },
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
                 decorationBox = { inner ->
                     Box {
@@ -1772,6 +2159,7 @@ fun ArchiveScreen(archivedTasks: List<TaskEntity>, onRestore: (TaskEntity) -> Un
     BackHandler(onBack = onBack)
     val context = LocalContext.current
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    var showOlder by rememberSaveable { mutableStateOf(false) }
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
@@ -1795,34 +2183,60 @@ fun ArchiveScreen(archivedTasks: List<TaskEntity>, onRestore: (TaskEntity) -> Un
                 item(key = "hint") {
                     Text("Use the arrow on the right to send a task back to its list.", style = MaterialTheme.typography.bodySmall, color = muted.copy(alpha = 0.6f), modifier = Modifier.padding(start = 20.dp, bottom = 8.dp))
                 }
-                items(archivedTasks, key = { it.id }) { t ->
-                    Row(modifier = Modifier.animateItemPlacement().fillMaxWidth().padding(start = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier.size(48.dp),
-                            contentAlignment = Alignment.Center
+                val weekAgo = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000
+                val recent = archivedTasks.filter { it.archivedAt >= weekAgo }
+                val older = archivedTasks.filter { it.archivedAt < weekAgo }
+                if (recent.isEmpty()) item(key = "norecent") {
+                    Text("Nothing archived in the last 7 days.", style = MaterialTheme.typography.bodyMedium, color = muted.copy(alpha = 0.6f), modifier = Modifier.padding(start = 20.dp, top = 8.dp, bottom = 8.dp))
+                }
+                items(recent, key = { it.id }) { t -> ArchiveRow(t, onRestore) }
+                if (older.isNotEmpty()) {
+                    item(key = "olderHeader") {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 12.dp).clip(RoundedCornerShape(14.dp)).clickable { triggerHaptic(context, HapticStyle.TICK); showOlder = !showOlder }.padding(horizontal = 20.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Box(
-                                modifier = Modifier.size(22.dp).clip(CircleShape)
-                                    .background(if (t.isCompleted) muted.copy(alpha = 0.35f) else Color.Transparent)
-                                    .then(if (t.isCompleted) Modifier else Modifier.border(1.5.dp, muted.copy(alpha = 0.5f), CircleShape)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                if (t.isCompleted) Icon(Icons.Default.Check, contentDescription = "Completed", tint = MaterialTheme.colorScheme.background, modifier = Modifier.size(14.dp))
-                            }
-                        }
-                        Column(modifier = Modifier.weight(1f).padding(vertical = 14.dp, horizontal = 6.dp)) {
-                            Text(t.title, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, textDecoration = if (t.isCompleted) TextDecoration.LineThrough else TextDecoration.None), color = muted.copy(alpha = 0.55f))
-                            if (t.notes.isNotBlank()) {
-                                Text(t.notes, style = MaterialTheme.typography.bodySmall, color = muted.copy(alpha = 0.4f), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
-                            }
-                            if (t.focusSessions > 0) TimerBadgesFit(t.focusSessions, size = 20.dp, modifier = Modifier.padding(top = 6.dp))
-                        }
-                        IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.UNDO); onRestore(t) }) {
-                            Icon(Icons.Outlined.Unarchive, contentDescription = "Send back to the list", tint = muted.copy(alpha = 0.7f), modifier = Modifier.size(21.dp))
+                            Text("OLDER · ${older.size}", style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.6.sp, fontWeight = FontWeight.Medium), color = muted.copy(alpha = 0.75f), modifier = Modifier.weight(1f))
+                            Icon(if (showOlder) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, contentDescription = if (showOlder) "Fold older tasks" else "Show older tasks", tint = muted.copy(alpha = 0.7f))
                         }
                     }
+                    if (showOlder) items(older, key = { it.id }) { t -> ArchiveRow(t, onRestore) }
                 }
             }
         }
     }
 }
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun androidx.compose.foundation.lazy.LazyItemScope.ArchiveRow(t: TaskEntity, onRestore: (TaskEntity) -> Unit) {
+    val context = LocalContext.current
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    Row(modifier = Modifier.animateItemPlacement().fillMaxWidth().padding(start = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier.size(48.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier.size(22.dp).clip(CheckShape)
+                    .background(if (t.isCompleted) muted.copy(alpha = 0.35f) else Color.Transparent)
+                    .then(if (t.isCompleted) Modifier else Modifier.border(1.5.dp, muted.copy(alpha = 0.5f), CheckShape)),
+                contentAlignment = Alignment.Center
+            ) {
+                if (t.isCompleted) Icon(Icons.Default.Check, contentDescription = "Completed", tint = MaterialTheme.colorScheme.background, modifier = Modifier.size(14.dp))
+            }
+        }
+        Column(modifier = Modifier.weight(1f).padding(vertical = 14.dp, horizontal = 6.dp)) {
+            Text(t.title, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, textDecoration = if (t.isCompleted) TextDecoration.LineThrough else TextDecoration.None), color = muted.copy(alpha = 0.55f))
+            if (t.notes.isNotBlank()) {
+                Text(t.notes, style = MaterialTheme.typography.bodySmall, color = muted.copy(alpha = 0.4f), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
+            }
+            if (t.focusSessions > 0) TimerBadgesFit(t.focusSessions, size = 20.dp, modifier = Modifier.padding(top = 6.dp))
+        }
+        IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.UNDO); onRestore(t) }) {
+            Icon(Icons.Outlined.Unarchive, contentDescription = "Send back to the list", tint = muted.copy(alpha = 0.7f), modifier = Modifier.size(21.dp))
+        }
+
+    }
+}
+
