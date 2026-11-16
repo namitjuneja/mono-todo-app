@@ -2,6 +2,10 @@
 
 An Android to-do app that cuts list overwhelm by putting one task in front of you at a time.
 
+## Download
+
+[apk/MonoFocus-debug.apk](apk/MonoFocus-debug.apk) – open the file page on GitHub and tap Download, then install it on your phone.
+
 ## Features
 
 ### Tasks
