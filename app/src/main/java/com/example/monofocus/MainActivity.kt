@@ -404,6 +404,18 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         }
     }
 
+    /** An empty separator slotted in right after [afterId]. */
+    fun insertSeparatorAfter(afterId: Long) {
+        viewModelScope.launch {
+            val order = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L
+            val newId = dao.insert(TaskEntity(title = "", queueOrder = order, playlist = _playlist.value, isSeparator = true))
+            val ids = todayList.value.map { it.id }.toMutableList()
+            val at = ids.indexOf(afterId)
+            ids.add(if (at >= 0) at + 1 else ids.size, newId)
+            dao.setOrders(ids)
+        }
+    }
+
     fun addTasksToFront(rawInput: String, notes: String, onReady: () -> Unit) {
         val lines = rawInput.lines().map { it.trim() }.filter { it.isNotBlank() }
         if (lines.isEmpty()) return
@@ -865,19 +877,22 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                 .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "MONO uses this only to lock your phone when you turn on \"keep screen on\", so the screen can stay lit without leaving your phone open.")
         )
     }
+    // Settings and the archive always wear the Main list's colours, whichever list they were opened from.
+    val onSettings = screen == ScreenState.SETTINGS || screen == ScreenState.ARCHIVE
+    val shownPlaylist = if (onSettings) "main" else playlist
     fun autoEye() { if ((playlist == "morning" || playlist == "night") && !keepScreenOn) toggleKeepAwake() }
     LockedDisplayEffect(active = keepScreenOn && eyeLocks)
-    SystemBarsAndWakeEffect(immersiveFullScreen = (screen == ScreenState.FOCUS), keepScreenOn = keepScreenOn || medTimer?.done == false, isDark = (isOledDark && playlist != "morning") || playlist == "night" || playlist == "cleaning")
+    SystemBarsAndWakeEffect(immersiveFullScreen = (screen == ScreenState.FOCUS), keepScreenOn = keepScreenOn || medTimer?.done == false, isDark = (isOledDark && shownPlaylist != "morning") || shownPlaylist == "night" || shownPlaylist == "cleaning")
 
-    MonoFocusTheme(isDark = isOledDark, playlist = if (diceSession && screen == ScreenState.FOCUS) "cleaning" else playlist) {
+    MonoFocusTheme(isDark = isOledDark, playlist = if (diceSession && screen == ScreenState.FOCUS) "cleaning" else shownPlaylist) {
     // The page base follows bgKey (not the live theme), so the old colour holds until the wash has covered it.
     val themeBg = MaterialTheme.colorScheme.background
     var mainBg by remember { mutableStateOf(themeBg) }
-    SideEffect { if (playlist == "main" && bgKey == "main") mainBg = themeBg }
-    Surface(modifier = Modifier.fillMaxSize(), color = if (bgKey == "main" || (diceSession && screen == ScreenState.FOCUS)) (if (bgKey == "main") mainBg else themeBg) else playlistFlat(bgKey)) {
+    SideEffect { if (onSettings || (playlist == "main" && bgKey == "main")) mainBg = themeBg }
+    Surface(modifier = Modifier.fillMaxSize(), color = if (onSettings || bgKey == "main" || (diceSession && screen == ScreenState.FOCUS)) (if (onSettings || bgKey == "main") mainBg else themeBg) else playlistFlat(bgKey)) {
       Box(Modifier.fillMaxSize()) {
         // A dice-rolled cleaning task always sits on the Cleaning gradient, even when rolled from Main.
-        PlaylistBackdrop(if (diceSession && screen == ScreenState.FOCUS) "cleaning" else bgKey)
+        PlaylistBackdrop(if (diceSession && screen == ScreenState.FOCUS) "cleaning" else if (onSettings) "main" else bgKey)
         PlaylistWash(reveal = washReveal.value, alpha = washAlpha.value, key = washKey, center = washCenter)
         AnimatedContent(
             modifier = Modifier.graphicsLayer { alpha = contentAlpha.value },
@@ -902,7 +917,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     onOpenSettings = { returnId = null; screen = ScreenState.SETTINGS },
                     keepScreenOn = keepScreenOn, onToggleKeepScreenOn = { toggleKeepAwake() },
                     onArchiveAll = viewModel::archiveAll,
-                    onInsertAfter = viewModel::insertAfter, onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
+                    onInsertAfter = viewModel::insertAfter, onInsertSeparatorAfter = viewModel::insertSeparatorAfter, onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
                     playlist = playlist, onPlaylist = { k, c -> switchPlaylist(k, c) },
                     onRoll = { rollDice(null) },
                     onCleaningToggle = { c -> switchPlaylist(if (playlist == "cleaning") "main" else "cleaning", c) },
@@ -1064,7 +1079,7 @@ fun HomeScreen(
     tasks: List<TaskEntity>, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions,
     onAddTasks: (String) -> Unit, onComplete: (TaskEntity) -> Unit, onUndoComplete: (TaskEntity) -> Unit,
     onReorder: (List<TaskEntity>) -> Unit, onSelect: (TaskEntity, Float) -> Unit, onOpenSettings: () -> Unit, onArchiveAll: () -> Unit, onArchiveTask: (TaskEntity) -> Unit,
-    onInsertAfter: (Long, String) -> Unit, onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
+    onInsertAfter: (Long, String) -> Unit, onInsertSeparatorAfter: (Long) -> Unit, onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
     playlist: String, onPlaylist: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit,
     autoSelectId: Long?, returnId: Long?, returnY: Float, onReturnConsumed: () -> Unit,
     keepScreenOn: Boolean = false, onToggleKeepScreenOn: () -> Unit = {}
@@ -1132,7 +1147,7 @@ fun HomeScreen(
         if (i >= 0 && readyId != autoSelectId) { centerRow(i, autoSelectId); readyId = autoSelectId }
     }
 
-    // Pull-apart: put two fingers on the line between two tasks and spread them. A gap opens, then a blank row with the keyboard.
+    // Hold on the line between two tasks: a gap opens, then a blank row with the keyboard (or a separator if you keep holding).
     var gapAfterId by remember { mutableStateOf<Long?>(null) }
     var spreadAfterId by remember { mutableStateOf<Long?>(null) }
     var spreadAmount by remember { mutableFloatStateOf(0f) }
@@ -1153,16 +1168,22 @@ fun HomeScreen(
     }
     val spreadNeeded = remember(density) { with(density) { 52.dp.toPx() } }
     val spreadTol = remember(density) { with(density) { 12.dp.toPx() } }
-    // One finger: press and hold on the seam between two tasks, then pull down. A gap opens under your finger, then a blank row.
+    // One finger: press and hold on the seam between two tasks. Let go after a moment for a new to-do, keep holding for a separator.
     val spreadGesture = Modifier.pointerInput(Unit) {
         awaitEachGesture {
             val first = awaitFirstDown(requireUnconsumed = false, pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial)
             touching = true
             val seam: Long? = if (selectingId == null && draggingId == null && gapAfterId == null)
-                listState.layoutInfo.visibleItemsInfo.map { (it.offset + it.size) to it.key }
+                listState.layoutInfo.visibleItemsInfo.let { vis ->
+                    // A press that lands on a separator belongs to the separator (hold to move it), not to the seam gesture.
+                    val sepIds = items.filter { it.isSeparator }.map { it.id }.toSet()
+                    if (vis.any { it.key in sepIds && first.position.y > it.offset && first.position.y < it.offset + it.size }) emptyList()
+                    else vis.filter { it.key !in sepIds }.map { (it.offset + it.size) to it.key }
+                }
                     .filter { kotlin.math.abs(it.first - first.position.y) <= spreadTol }
                     .minByOrNull { kotlin.math.abs(it.first - first.position.y) }?.second as? Long else null
             var stillDown = true
+            var eatRest = false   // the lift after a long hold must not also count as a tap on the row
             if (seam != null) {
                 // Hold still for a moment: anything quicker is an ordinary tap or scroll and is left alone.
                 val cancelled = withTimeoutOrNull(340L) {
@@ -1175,26 +1196,32 @@ fun HomeScreen(
                     }
                     true
                 }
-                if (cancelled == null) {
+                if (cancelled == null && stillDown) {
+                    // Held on the seam: the line opens up. Let go after a while for a new to-do, keep holding for a separator.
                     triggerHaptic(context, HapticStyle.TICK)
                     multiTouch = true; spreadAfterId = seam; spreadAmount = 0f
-                    var fired = false
-                    while (stillDown) {
-                        val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
-                        stillDown = e.changes.any { it.pressed }
-                        val c = e.changes.firstOrNull { it.id == first.id } ?: break
-                        e.changes.forEach { it.consume() }   // the list must not scroll and no row may be picked up
-                        if (!fired) {
-                            val amount = ((c.position.y - first.position.y) / spreadNeeded).coerceIn(0f, 1f)
-                            spreadAmount = amount
-                            if (amount >= 1f) { fired = true; triggerHaptic(context, HapticStyle.CONFIRM); gapAfterId = seam; spreadAfterId = null; spreadAmount = 0f }
+                    val t0 = android.os.SystemClock.uptimeMillis()
+                    var result = 0   // 0 = cancelled, 1 = new to-do, 2 = separator
+                    while (true) {
+                        val elapsed = android.os.SystemClock.uptimeMillis() - t0
+                        if (elapsed >= 800L) { result = 2; break }
+                        spreadAmount = (elapsed / 260f).coerceIn(0f, 1f)
+                        val e = withTimeoutOrNull(40L) { awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial) }
+                        if (e != null) {
+                            e.changes.forEach { it.consume() }
+                            stillDown = e.changes.any { it.pressed }
+                            val c = e.changes.firstOrNull { it.id == first.id }
+                            if (c == null || (c.position - first.position).getDistance() > viewConfiguration.touchSlop * 3) { result = 0; break }
+                            if (!stillDown) { result = if (elapsed >= 260L) 1 else 0; break }
                         }
                     }
                     multiTouch = false
-                    if (!fired) { spreadAfterId = null; spreadAmount = 0f }
+                    spreadAfterId = null; spreadAmount = 0f
+                    if (result == 1) { triggerHaptic(context, HapticStyle.CONFIRM); gapAfterId = seam }
+                    if (result == 2) { triggerHaptic(context, HapticStyle.CONFIRM); onInsertSeparatorAfter(seam); eatRest = true }
                 }
             }
-            while (stillDown) { val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial); stillDown = e.changes.any { it.pressed } }
+            while (stillDown) { val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial); if (eatRest) e.changes.forEach { it.consume() }; stillDown = e.changes.any { it.pressed } }
             touching = false
         }
     }
@@ -2139,7 +2166,7 @@ fun FocusScreen(
                         modifier = Modifier.graphicsLayer { alpha = undoAlpha }.clip(CircleShape).background(MaterialTheme.colorScheme.surface)
                             .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
                             .clickable(enabled = undoTask != null) {
-                                undoTask?.let { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.UNDO); onUndo(it) }
+                                undoTask?.let { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.UNDO); goingBack = true; onUndo(it) }
                             }
                             .padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
