@@ -28,7 +28,7 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 - **Steps** – show every step, or just the next one.
 - **Stuck menu** – try 2 minutes, break it into steps, or do something else first.
 - **Done** – a short win moment, then the next task opens.
-- **Double-tap** – double-tap empty space on the list to start focus on the first open task.
+- **Double-tap** – double-tap empty space (including beside the list-button tab) to start focus on the first open task, with the same grow-into-focus animation as tapping it.
 - **Landscape** – rotate for a flash-card view: the title is centred and large, steps are hidden.
 - **Undo** – floats 10% from the top for 3 seconds after finishing. Leaving focus or moving to another task dismisses it.
 - **Cleaning focus** – no stuck (?) button. Steps can be added in the editor only, not in focus.
@@ -40,7 +40,8 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 
 ### Lists
 - **Main, Morning, Night, Cleaning** – each with its own tasks and colour.
-- **Switch** – tap the sun or moon; tap again, or use the back arrow, to return.
+- **Switch** – tap the sun or moon; tap again, or use the back arrow or the system Back, to return to Main.
+- **Dock** – the list scrolls underneath it, so text shows in the transparent corners beside the tab.
 - **Wash transition** – the new colour spreads from the button.
 - **Daily reset** – Morning and Night uncheck themselves at times you choose.
 

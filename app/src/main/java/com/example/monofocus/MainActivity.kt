@@ -16,6 +16,7 @@ import android.os.VibratorManager
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.*
@@ -831,10 +832,6 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     autoSelectId = autoSelectId,
                     onOpenSettings = { returnId = null; screen = ScreenState.SETTINGS },
                     keepScreenOn = keepScreenOn, onToggleKeepScreenOn = { toggleKeepAwake() },
-                    onStartFirst = {
-                        val first = todayList.firstOrNull { !it.isSeparator && !it.isCompleted }
-                        if (first != null) { autoEye(); diceSession = false; focusedId = first.id; focusTitleY = 420f; returnId = null; autoSelectId = null; screen = ScreenState.FOCUS }
-                    },
                     onArchiveAll = viewModel::archiveAll,
                     onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
                     playlist = playlist, onPlaylist = { k, c -> switchPlaylist(k, c) },
@@ -989,7 +986,7 @@ fun HomeScreen(
     onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
     playlist: String, onPlaylist: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit,
     autoSelectId: Long?, returnId: Long?, returnY: Float, onReturnConsumed: () -> Unit,
-    keepScreenOn: Boolean = false, onToggleKeepScreenOn: () -> Unit = {}, onStartFirst: () -> Unit = {}
+    keepScreenOn: Boolean = false, onToggleKeepScreenOn: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -997,6 +994,8 @@ fun HomeScreen(
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     var input by remember { mutableStateOf("") }
+    var quickId by remember { mutableStateOf<Long?>(null) }
+    var dockH by remember { mutableStateOf(0.dp) }
     var glyphRowCenter by remember { mutableStateOf(Offset.Zero) }
     // When coming back from the focus screen the list starts in the "selected" look and plays the animation in reverse.
     var selectingId by remember { mutableStateOf(returnId) }
@@ -1062,6 +1061,21 @@ fun HomeScreen(
         }
     }
 
+    // Double-tapping empty space opens the first open task through the same grow-into-focus animation as tapping it.
+    fun startFirst() {
+        if (selectingId != null || draggingId != null) return
+        val i = items.indexOfFirst { !it.isSeparator && !it.isCompleted }
+        if (i < 0) return
+        val id = items[i].id
+        if (listState.layoutInfo.visibleItemsInfo.none { it.key == id }) scope.launch { listState.scrollToItem(i); quickId = id } else quickId = id
+    }
+
+    // On Morning / Night / Cleaning, Back returns to Main instead of leaving the app.
+    BackHandler(enabled = playlist != "main" && selectingId == null) {
+        triggerHaptic(context, HapticStyle.TICK)
+        onPlaylist("main", glyphRowCenter + Offset(with(density) { 24.dp.toPx() } * (if (playlist == "morning") -1 else 1), 0f))
+    }
+
     fun submit() {
         if (input.isNotBlank()) {
             triggerHaptic(context, HapticStyle.TICK)
@@ -1104,7 +1118,9 @@ fun HomeScreen(
             }
         }
 
-        Box(modifier = Modifier.weight(1f).fillMaxWidth().nestedScroll(pullConnection).pointerInput(Unit) { detectTapGestures(onDoubleTap = { if (selectingId == null && draggingId == null) onStartFirst() }) }) {
+        // The list runs underneath the dock, so the empty corners beside the list-button tab show the text and take double-taps too.
+        Box(modifier = Modifier.weight(1f).fillMaxWidth().pointerInput(Unit) { detectTapGestures(onDoubleTap = { startFirst() }) }) {
+        Box(modifier = Modifier.fillMaxSize().nestedScroll(pullConnection)) {
             // The gear that rises out of the top edge while you pull.
             val reveal = (pull / pullThreshold).coerceIn(0f, 1f)
             if (reveal > 0.02f) Box(
@@ -1127,7 +1143,7 @@ fun HomeScreen(
             if (items.isEmpty()) {
                 Text(if (playlist == "cleaning") "Add tiny 2-minute cleans here." else "Nothing to do.", modifier = Modifier.align(Alignment.Center), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { translationY = pull }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { translationY = pull }, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp + dockH)) {
                 items(items, key = { it.id }) { task ->
                     val isDragging = draggingId == task.id
                     val rowModifier = if (isDragging || selectingId == task.id) Modifier.zIndex(1f) else Modifier.animateItemPlacement()
@@ -1186,9 +1202,10 @@ fun HomeScreen(
                         modifier = rowModifier,
                         selection = when (selectingId) { null -> 0; task.id -> 2; else -> 1 },
                         focusX = focusX, minY = minY, maxY = maxY, morphY = morphY,
-                        autoSelect = autoSelectId == task.id,
+                        autoSelect = autoSelectId == task.id || quickId == task.id,
                         onSelect = { y ->
                             if (selectingId == null && draggingId == null && !task.isCompleted) {
+                                quickId = null
                                 triggerHaptic(context, HapticStyle.CONFIRM)
                                 Sfx.play(Sound.TICK)
                                 focusManager.clearFocus()
@@ -1206,7 +1223,7 @@ fun HomeScreen(
             }
         }
 
-        Column(modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = chromeAlpha }.navigationBarsPadding().imePadding().padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 8.dp)) {
+        Column(modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().onSizeChanged { dockH = with(density) { it.height.toDp() } }.graphicsLayer { alpha = chromeAlpha }.navigationBarsPadding().imePadding().padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 8.dp)) {
             // One shape, one outline: the bar with a raised centre tab that holds the list buttons. The tab sits above the text area, never over it.
             val dockDensity = LocalDensity.current
             val dockShape = remember(dockDensity) { DockShape(with(dockDensity) { 116.dp.toPx() }, with(dockDensity) { 48.dp.toPx() }, with(dockDensity) { 22.dp.toPx() }, with(dockDensity) { 22.dp.toPx() }) }
@@ -1267,6 +1284,7 @@ fun HomeScreen(
                 }
             }
             }
+        }
         }
     }
 
