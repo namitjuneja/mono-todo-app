@@ -136,6 +136,7 @@ fun SettingsScreen(
     morningMin: Int, nightMin: Int, onMorningMin: (Int) -> Unit, onNightMin: (Int) -> Unit,
     autoNext: Boolean, onAutoNext: (Boolean) -> Unit, stopAtSep: Boolean, onStopAtSep: (Boolean) -> Unit,
     soundOn: Boolean, onSound: (Boolean) -> Unit, hapticsOn: Boolean, onHaptics: (Boolean) -> Unit,
+    eyeLocks: Boolean, onEyeLocks: (Boolean) -> Unit,
     medDefault: Int, onMedDefault: (Int) -> Unit,
     sleepOn: Boolean, sleepMin: Int, onSleepOn: (Boolean) -> Unit, onSleepMin: (Int) -> Unit,
     isDark: Boolean, onDark: (Boolean) -> Unit,
@@ -164,6 +165,9 @@ fun SettingsScreen(
             Box(Modifier.alpha(if (autoNext) 1f else 0.4f)) {
                 SettingRow("Stop at separators", "Return to the list at a separator instead of skipping it", onClick = if (autoNext) ({ onStopAtSep(!stopAtSep) }) else null) { QuietCheck(stopAtSep, onStopAtSep, enabled = autoNext) }
             }
+
+            SectionLabel("Eye")
+            SettingRow("Lock the phone", "Off: the eye only keeps the screen on, without locking the phone", onClick = { onEyeLocks(!eyeLocks) }) { QuietCheck(eyeLocks, onEyeLocks) }
 
             SectionLabel("Meditation")
             SettingRow("Timer length", "Default for the timer on meditate and focus tasks") {

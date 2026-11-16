@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Compact row: a small grey bed glyph, then the time. -->
+<!-- One compact row: the bed glyph flush left, the time on the right. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
@@ -10,19 +10,23 @@
 
     <ImageView
         android:id="@+id/sleep_glyph"
-        android:layout_width="16dp"
-        android:layout_height="16dp"
+        android:layout_width="20dp"
+        android:layout_height="20dp"
         android:importantForAccessibility="no"
+        android:scaleType="fitStart"
         android:src="@drawable/ic_bed" />
 
     <TextView
         android:id="@+id/sleep_time"
-        android:layout_width="wrap_content"
+        android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:layout_marginStart="12dp"
+        android:layout_marginEnd="30dp"
+        android:layout_weight="1"
         android:fontFamily="sans-serif-light"
+        android:gravity="end"
         android:includeFontPadding="false"
         android:letterSpacing="-0.02"
         android:maxLines="1"
-        android:textSize="26sp" />
+        android:textSize="30sp" />
 </LinearLayout>

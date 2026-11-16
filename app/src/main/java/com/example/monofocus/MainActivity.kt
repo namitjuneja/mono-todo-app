@@ -55,6 +55,10 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.foundation.gestures.awaitEachGesture
+import kotlinx.coroutines.withTimeoutOrNull
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.text.input.ImeAction
@@ -386,6 +390,20 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         }
     }
 
+    /** A new task slotted in right after [afterId] (a task or a separator), keeping everything else in place. */
+    fun insertAfter(afterId: Long, title: String) {
+        val t = title.trim()
+        if (t.isEmpty()) return
+        viewModelScope.launch {
+            val order = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L
+            val newId = dao.insert(TaskEntity(title = t, queueOrder = order, playlist = _playlist.value))
+            val ids = todayList.value.map { it.id }.toMutableList()
+            val at = ids.indexOf(afterId)
+            ids.add(if (at >= 0) at + 1 else ids.size, newId)
+            dao.setOrders(ids)
+        }
+    }
+
     fun addTasksToFront(rawInput: String, notes: String, onReady: () -> Unit) {
         val lines = rawInput.lines().map { it.trim() }.filter { it.isNotBlank() }
         if (lines.isEmpty()) return
@@ -658,6 +676,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
     var stopAtSep by remember { mutableStateOf(uiPrefs.getBoolean("stop_at_separator", true)) }
     var morningMin by remember { mutableIntStateOf(resetMinutes(appContext, "morning")) }
     var nightMin by remember { mutableIntStateOf(resetMinutes(appContext, "night")) }
+    var eyeLocks by remember { mutableStateOf(uiPrefs.getBoolean("eye_locks", true)) }
     var medDefault by remember { mutableIntStateOf(uiPrefs.getInt("med_default", 5)) }
     var sleepOn by remember { mutableStateOf(sleepEnabled(appContext)) }
     var sleepMin by remember { mutableIntStateOf(sleepMinutes(appContext)) }
@@ -822,9 +841,10 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
     // Eye on but the phone got unlocked (e.g. you left and came back): lock it again.
     val keyguard = remember { activity.getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager }
     val eyeOn by rememberUpdatedState(keepScreenOn)
+    val eyeLocksNow by rememberUpdatedState(eyeLocks)
     DisposableEffect(activity) {
         val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
-            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME && eyeOn && !locking && dpm.isAdminActive(adminComponent) && !keyguard.isKeyguardLocked) lockAndKeepAwake()
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME && eyeOn && eyeLocksNow && !locking && dpm.isAdminActive(adminComponent) && !keyguard.isKeyguardLocked) lockAndKeepAwake()
         }
         val owner = activity as androidx.activity.ComponentActivity
         owner.lifecycle.addObserver(obs)
@@ -837,6 +857,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
     }
     val toggleKeepAwake = {
         if (keepScreenOn) keepScreenOn = false
+        else if (!eyeLocks) keepScreenOn = true   // only keeps the screen on; the phone is not locked
         else if (dpm.isAdminActive(adminComponent)) lockAndKeepAwake()
         else adminLauncher.launch(
             Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
@@ -845,7 +866,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
         )
     }
     fun autoEye() { if ((playlist == "morning" || playlist == "night") && !keepScreenOn) toggleKeepAwake() }
-    LockedDisplayEffect(active = keepScreenOn)
+    LockedDisplayEffect(active = keepScreenOn && eyeLocks)
     SystemBarsAndWakeEffect(immersiveFullScreen = (screen == ScreenState.FOCUS), keepScreenOn = keepScreenOn || medTimer?.done == false, isDark = (isOledDark && playlist != "morning") || playlist == "night" || playlist == "cleaning")
 
     MonoFocusTheme(isDark = isOledDark, playlist = if (diceSession && screen == ScreenState.FOCUS) "cleaning" else playlist) {
@@ -881,7 +902,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     onOpenSettings = { returnId = null; screen = ScreenState.SETTINGS },
                     keepScreenOn = keepScreenOn, onToggleKeepScreenOn = { toggleKeepAwake() },
                     onArchiveAll = viewModel::archiveAll,
-                    onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
+                    onInsertAfter = viewModel::insertAfter, onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
                     playlist = playlist, onPlaylist = { k, c -> switchPlaylist(k, c) },
                     onRoll = { rollDice(null) },
                     onCleaningToggle = { c -> switchPlaylist(if (playlist == "cleaning") "main" else "cleaning", c) },
@@ -932,6 +953,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     stopAtSep = stopAtSep, onStopAtSep = { stopAtSep = it; uiPrefs.edit().putBoolean("stop_at_separator", it).apply() },
                     soundOn = soundOn, onSound = { soundOn = it; Sfx.enabled = it; uiPrefs.edit().putBoolean("sounds", it).apply(); if (it) Sfx.play(Sound.TICK) },
                     hapticsOn = hapticsOn, onHaptics = { hapticsOn = it; Haptics.enabled = it; uiPrefs.edit().putBoolean("haptics", it).apply(); if (it) triggerHaptic(appContext, HapticStyle.TICK) },
+                    eyeLocks = eyeLocks, onEyeLocks = { eyeLocks = it; uiPrefs.edit().putBoolean("eye_locks", it).apply() },
                     medDefault = medDefault, onMedDefault = { medDefault = it; uiPrefs.edit().putInt("med_default", it).apply() },
                     sleepOn = sleepOn, sleepMin = sleepMin,
                     onSleepOn = { on ->
@@ -1042,7 +1064,7 @@ fun HomeScreen(
     tasks: List<TaskEntity>, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions,
     onAddTasks: (String) -> Unit, onComplete: (TaskEntity) -> Unit, onUndoComplete: (TaskEntity) -> Unit,
     onReorder: (List<TaskEntity>) -> Unit, onSelect: (TaskEntity, Float) -> Unit, onOpenSettings: () -> Unit, onArchiveAll: () -> Unit, onArchiveTask: (TaskEntity) -> Unit,
-    onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
+    onInsertAfter: (Long, String) -> Unit, onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
     playlist: String, onPlaylist: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit,
     autoSelectId: Long?, returnId: Long?, returnY: Float, onReturnConsumed: () -> Unit,
     keepScreenOn: Boolean = false, onToggleKeepScreenOn: () -> Unit = {}
@@ -1078,24 +1100,103 @@ fun HomeScreen(
     // After finishing a task the next one is opened automatically; make sure its row is on screen first.
     // The row is brought to the middle of the visible area (above the dock) first; only then does it start growing into focus.
     var readyId by remember { mutableStateOf<Long?>(null) }
-    suspend fun centerRow(i: Int, id: Long) {
-        val dockPx = with(density) { dockH.toPx() }
+    val imeInsets = WindowInsets.ime
+    suspend fun centerRow(i: Int, id: Long, force: Boolean = false) {
+        val dockPx = with(density) { dockH.toPx() }   // already includes the keyboard when it is up
         fun info() = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == id }
         val viewH = listState.layoutInfo.viewportSize.height.toFloat()
         val topEdge = with(density) { 8.dp.toPx() }
         val bottomEdge = viewH - dockPx
         val target = (topEdge + bottomEdge) / 2f
-        var it0 = info()
-        val fullyVisible = it0 != null && it0.offset >= topEdge && it0.offset + it0.size <= bottomEdge
-        if (fullyVisible) return
-        if (it0 == null) { listState.scrollToItem(i); it0 = info() ?: return; listState.scrollBy(it0.offset + it0.size / 2f - target) }
-        else listState.animateScrollBy(it0.offset + it0.size / 2f - target, tween(320, easing = FastOutSlowInEasing))
-        delay(60)
+        val cur = info()
+        if (!force && cur != null && cur.offset >= topEdge && cur.offset + cur.size <= bottomEdge) return
+        // One long, eased glide for the whole distance (estimated from the rows on screen when the target is off screen),
+        // then a tiny correction once the real row is measured. No jumps.
+        val delta = if (cur != null) cur.offset + cur.size / 2f - target else {
+            val vis = listState.layoutInfo.visibleItemsInfo
+            val first = vis.firstOrNull() ?: return
+            val avg = vis.sumOf { it.size }.toFloat() / vis.size
+            first.offset + (i - first.index) * avg + avg / 2f - target
+        }
+        val ms = (380 + kotlin.math.abs(delta) / density.density * 0.35f).toInt().coerceAtMost(900)
+        listState.animateScrollBy(delta, tween(ms, easing = FastOutSlowInEasing))
+        info()?.let { r ->
+            val err = r.offset + r.size / 2f - target
+            if (kotlin.math.abs(err) > 3f) listState.animateScrollBy(err, tween(200, easing = FastOutSlowInEasing))
+        }
+        delay(40)
     }
     LaunchedEffect(autoSelectId, items.size) {
         if (autoSelectId == null) { readyId = null; return@LaunchedEffect }
         val i = items.indexOfFirst { it.id == autoSelectId }
         if (i >= 0 && readyId != autoSelectId) { centerRow(i, autoSelectId); readyId = autoSelectId }
+    }
+
+    // Pull-apart: put two fingers on the line between two tasks and spread them. A gap opens, then a blank row with the keyboard.
+    var gapAfterId by remember { mutableStateOf<Long?>(null) }
+    var spreadAfterId by remember { mutableStateOf<Long?>(null) }
+    var spreadAmount by remember { mutableFloatStateOf(0f) }
+    var multiTouch by remember { mutableStateOf(false) }
+    var touching by remember { mutableStateOf(false) }
+
+    // When the blank row opens, lift the list so it sits above the keyboard (after the keyboard has finished rising).
+    LaunchedEffect(gapAfterId) {
+        val id = gapAfterId ?: return@LaunchedEffect
+        // Wait for the keyboard to finish rising (and the list's bottom room to grow with it), then lift the row.
+        var prev = -1
+        for (k in 0 until 25) { val b = imeInsets.getBottom(density); if (b > 0 && b == prev) break; prev = b; delay(60) }
+        delay(120)
+        // A finger still on the screen outranks a programmatic scroll, so wait for it to lift.
+        while (touching) delay(30)
+        val i = items.indexOfFirst { it.id == id }
+        if (i >= 0) centerRow(i, id, force = true)
+    }
+    val spreadNeeded = remember(density) { with(density) { 52.dp.toPx() } }
+    val spreadTol = remember(density) { with(density) { 12.dp.toPx() } }
+    // One finger: press and hold on the seam between two tasks, then pull down. A gap opens under your finger, then a blank row.
+    val spreadGesture = Modifier.pointerInput(Unit) {
+        awaitEachGesture {
+            val first = awaitFirstDown(requireUnconsumed = false, pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+            touching = true
+            val seam: Long? = if (selectingId == null && draggingId == null && gapAfterId == null)
+                listState.layoutInfo.visibleItemsInfo.map { (it.offset + it.size) to it.key }
+                    .filter { kotlin.math.abs(it.first - first.position.y) <= spreadTol }
+                    .minByOrNull { kotlin.math.abs(it.first - first.position.y) }?.second as? Long else null
+            var stillDown = true
+            if (seam != null) {
+                // Hold still for a moment: anything quicker is an ordinary tap or scroll and is left alone.
+                val cancelled = withTimeoutOrNull(340L) {
+                    var ok = true
+                    while (ok) {
+                        val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                        stillDown = e.changes.any { it.pressed }
+                        val c = e.changes.firstOrNull { it.id == first.id }
+                        if (c == null || !c.pressed || (c.position - first.position).getDistance() > viewConfiguration.touchSlop) ok = false
+                    }
+                    true
+                }
+                if (cancelled == null) {
+                    triggerHaptic(context, HapticStyle.TICK)
+                    multiTouch = true; spreadAfterId = seam; spreadAmount = 0f
+                    var fired = false
+                    while (stillDown) {
+                        val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                        stillDown = e.changes.any { it.pressed }
+                        val c = e.changes.firstOrNull { it.id == first.id } ?: break
+                        e.changes.forEach { it.consume() }   // the list must not scroll and no row may be picked up
+                        if (!fired) {
+                            val amount = ((c.position.y - first.position.y) / spreadNeeded).coerceIn(0f, 1f)
+                            spreadAmount = amount
+                            if (amount >= 1f) { fired = true; triggerHaptic(context, HapticStyle.CONFIRM); gapAfterId = seam; spreadAfterId = null; spreadAmount = 0f }
+                        }
+                    }
+                    multiTouch = false
+                    if (!fired) { spreadAfterId = null; spreadAmount = 0f }
+                }
+            }
+            while (stillDown) { val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial); stillDown = e.changes.any { it.pressed } }
+            touching = false
+        }
     }
 
     // Pull the list down from the top to open Settings. A gear fades in as you pull and clicks in when you can let go.
@@ -1194,7 +1295,7 @@ fun HomeScreen(
 
         // The list runs underneath the dock, so the empty corners beside the list-button tab show the text and take double-taps too.
         Box(modifier = Modifier.weight(1f).fillMaxWidth().pointerInput(Unit) { detectTapGestures(onDoubleTap = { startFirst() }) }) {
-        Box(modifier = Modifier.fillMaxSize().nestedScroll(pullConnection)) {
+        Box(modifier = Modifier.fillMaxSize().nestedScroll(pullConnection).then(spreadGesture)) {
             // The gear that rises out of the top edge while you pull.
             val reveal = (pull / pullThreshold).coerceIn(0f, 1f)
             if (reveal > 0.02f) Box(
@@ -1225,14 +1326,18 @@ fun HomeScreen(
                         val info = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == task.id }
                         if (info == null) dragDelta else dragDelta - (info.offset - dragStartOffset)
                     }
+                    // While two fingers are down (the pull-apart gesture) nothing may pick a row up.
                     val onDragStartRow = {
-                        triggerHaptic(context, HapticStyle.TICK)
-                        focusManager.clearFocus()
-                        draggingId = task.id
-                        dragDelta = 0f
-                        dragStartOffset = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == task.id }?.offset ?: 0
+                        if (!multiTouch) {
+                            triggerHaptic(context, HapticStyle.TICK)
+                            focusManager.clearFocus()
+                            draggingId = task.id
+                            dragDelta = 0f
+                            dragStartOffset = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == task.id }?.offset ?: 0
+                        }
                     }
                     val onDragRow = { dy: Float ->
+                      if (draggingId == task.id) {
                         dragDelta += dy
                         val info = listState.layoutInfo
                         val me = info.visibleItemsInfo.firstOrNull { it.key == task.id }
@@ -1256,11 +1361,14 @@ fun HomeScreen(
                             if (center < info.viewportStartOffset + 90f) scope.launch { listState.scrollBy(-24f) }
                             else if (center > info.viewportEndOffset - 90f) scope.launch { listState.scrollBy(24f) }
                         }
+                      }
                     }
                     val onDragEndRow = {
-                        draggingId = null
-                        dragDelta = 0f
-                        onReorder(items.toList())
+                        if (draggingId == task.id) {
+                            draggingId = null
+                            dragDelta = 0f
+                            onReorder(items.toList())
+                        }
                     }
                     if (task.isSeparator) {
                         SeparatorRow(
@@ -1268,6 +1376,8 @@ fun HomeScreen(
                             dragTranslation = dragTranslation, onEdit = { editingSeparator = task }, onDelete = { onDeleteSeparator(task) },
                             onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
                         )
+                        if (spreadAfterId == task.id) Box(Modifier.fillMaxWidth().height(2.dp + 49.dp * spreadAmount)) { Box(Modifier.fillMaxWidth().height(1.5.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))) }
+                        if (gapAfterId == task.id) NewTaskRow(onCommit = { onInsertAfter(task.id, it); gapAfterId = null }, onCancel = { gapAfterId = null })
                     } else TaskRow(
                         task = task,
                         subtasks = subtasksByTask[task.id].orEmpty(),
@@ -1294,6 +1404,8 @@ fun HomeScreen(
                         onToggleSub = editor.onToggleSub,
                         onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
                     )
+                    if (spreadAfterId == task.id) Box(Modifier.fillMaxWidth().height(2.dp + 49.dp * spreadAmount)) { Box(Modifier.fillMaxWidth().height(1.5.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))) }
+                    if (gapAfterId == task.id) NewTaskRow(onCommit = { onInsertAfter(task.id, it); gapAfterId = null }, onCancel = { gapAfterId = null })
                 }
             }
         }
@@ -1406,10 +1518,11 @@ fun SeparatorEditorSheet(task: TaskEntity, onSave: (String) -> Unit, onRemove: (
                 value = v, onValueChange = { v = it }, singleLine = true,
                 textStyle = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface),
                 cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused },
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { close() }),
                 decorationBox = { inner ->
                     Box {
-                        if (v.text.isEmpty()) Text("Separator label (optional)", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold), color = muted.copy(alpha = 0.5f))
+                        if (v.text.isEmpty()) Text("Separator label", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold), color = muted.copy(alpha = 0.5f))
                         inner()
                     }
                 }
@@ -1520,6 +1633,38 @@ fun InWindowSheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> 
     }
 }
 
+/** The blank row that opens between two tasks: the keyboard is up and the cursor is ready. Enter saves it; leaving it empty drops it. */
+@Composable
+fun NewTaskRow(onCommit: (String) -> Unit, onCancel: () -> Unit) {
+    var v by remember { mutableStateOf("") }
+    val focus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    var hadFocus by remember { mutableStateOf(false) }
+    var done by remember { mutableStateOf(false) }
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val appear = remember { Animatable(0f) }
+    val finish = { if (!done) { done = true; val t = v.trim(); if (t.isEmpty()) onCancel() else onCommit(t) } }
+    LaunchedEffect(Unit) { launch { appear.animateTo(1f, tween(220)) }; delay(60); focus.requestFocus(); keyboard?.show() }
+    BackHandler { if (!done) { done = true; onCancel() } }
+    Row(Modifier.fillMaxWidth().graphicsLayer { alpha = appear.value }.padding(start = 8.dp), verticalAlignment = Alignment.Top) {
+        Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+            Box(Modifier.size(22.dp).border(1.5.dp, muted.copy(alpha = 0.35f), CheckShape))
+        }
+        BasicTextField(
+            value = v, onValueChange = { v = it.replace("\n", "") }, singleLine = true,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 21.sp, fontWeight = FontWeight.Medium, letterSpacing = (-0.25).sp, color = MaterialTheme.colorScheme.onBackground),
+            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { finish() }),
+            modifier = Modifier.weight(1f).padding(start = 6.dp, end = 18.dp, top = 14.dp, bottom = 14.dp).focusRequester(focus)
+                .onFocusChanged { if (it.isFocused) hadFocus = true else if (hadFocus) finish() },
+            decorationBox = { inner ->
+                Box { if (v.isEmpty()) Text("New task", style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, fontWeight = FontWeight.Medium), color = muted.copy(alpha = 0.5f)); inner() }
+            }
+        )
+    }
+}
+
 /** The rounded square every check box uses, the same family as the big yellow check button. */
 val CheckShape = RoundedCornerShape(7.dp)
 
@@ -1585,6 +1730,16 @@ fun TaskRow(
                     }
                 )
             }
+            // Hold anywhere on the row to pick it up and move it.
+            .pointerInput(task.id, selection) {
+                if (selection != 0) return@pointerInput
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { triggerHaptic(context, HapticStyle.TICK); onDragStart() },
+                    onDrag = { change, amount -> change.consume(); onDrag(amount.y) },
+                    onDragEnd = { onDragEnd() },
+                    onDragCancel = { onDragEnd() }
+                )
+            }
             .drawBehind {
                 // A thin ring fills as you pull. At the threshold it completes, then the glyph settles into a check and lifts away.
                 val prog = (-swipe.value / swipeThreshold).coerceIn(0f, 1f)
@@ -1633,7 +1788,7 @@ fun TaskRow(
                 if (checked) Icon(Icons.Default.Check, contentDescription = "Completed. Tap to undo", tint = MaterialTheme.colorScheme.background, modifier = Modifier.size(14.dp))
             }
         }
-        Column(modifier = Modifier.weight(1f).combinedClickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = { onSelect(titleOrigin.y.coerceIn(minY, maxY)) }, onLongClick = onOpen).padding(vertical = 14.dp, horizontal = 6.dp)) {
+        Column(modifier = Modifier.weight(1f).combinedClickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onOpen, onDoubleClick = { onSelect(titleOrigin.y.coerceIn(minY, maxY)) }).padding(start = 6.dp, end = 18.dp, top = 14.dp, bottom = 14.dp)) {
             Text(
                 task.title,
                 style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 21.sp, fontWeight = FontWeight.Medium, letterSpacing = (-0.25).sp),
@@ -1659,7 +1814,7 @@ fun TaskRow(
             if (meta.isNotEmpty()) {
                 Text(meta, style = MaterialTheme.typography.bodySmall, color = muted.copy(alpha = 0.7f), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.graphicsLayer { alpha = partsAlpha }.padding(top = 2.dp))
             }
-            if (subtasks.isNotEmpty()) Column(Modifier.graphicsLayer { alpha = partsAlpha }.padding(top = 4.dp)) {
+            if (subtasks.isNotEmpty()) Column(Modifier.graphicsLayer { alpha = partsAlpha }.padding(top = 9.dp)) {
                 subtasks.forEach { sub ->
                     key(sub.id) {
                         Row(
@@ -1684,19 +1839,6 @@ fun TaskRow(
                 }
             }
             if (task.focusSessions > 0) TimerBadgesFit(task.focusSessions, size = 20.dp, modifier = Modifier.graphicsLayer { alpha = partsAlpha }.padding(top = 6.dp))
-        }
-        Box(
-            modifier = Modifier.graphicsLayer { alpha = partsAlpha }.size(48.dp).pointerInput(task.id) {
-                detectDragGestures(
-                    onDragStart = { onDragStart() },
-                    onDrag = { change, amount -> change.consume(); onDrag(amount.y) },
-                    onDragEnd = { onDragEnd() },
-                    onDragCancel = { onDragEnd() }
-                )
-            },
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(Icons.Outlined.DragHandle, contentDescription = "Reorder", tint = muted.copy(alpha = 0.5f))
         }
     }
 }
@@ -1737,6 +1879,9 @@ fun FocusScreen(
     val landscape = LocalConfiguration.current.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
     // Done is a wide pill: a big, easy target without a block of colour in the middle of the screen.
     val doneW = if (landscape) 168.dp else 116.dp
+    // The top edge of the screen can hold a camera hole: anything placed there must start below it.
+    val cutoutTop = with(LocalDensity.current) { WindowInsets.displayCutout.getTop(this).toDp() }
+    val bannerTop = maxOf(22.dp, cutoutTop + 8.dp)
     val doneH = if (landscape) 80.dp else 64.dp
     val titleTopPad = with(LocalDensity.current) { (titleY.toDp() - 56.dp).coerceAtLeast(8.dp) }
 
@@ -1970,23 +2115,26 @@ fun FocusScreen(
             onBannerDone()
         }
         if (bannerAlpha.value > 0.01f && bannerText != null) {
+            // Sits in the empty middle of the top bar, between the back arrow and the eye, but always below a camera cutout. Undo is kept below it.
+            val named = bannerText!!.isNotBlank()
             Row(
-                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = doneH + 44.dp, start = 28.dp, end = 28.dp).fillMaxWidth()
-                    .graphicsLayer { alpha = bannerAlpha.value; translationY = (1f - bannerAlpha.value) * 12f },
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = bannerTop).height(20.dp)
+                    .graphicsLayer { alpha = bannerAlpha.value; translationY = (bannerAlpha.value - 1f) * 10f },
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(Modifier.weight(1f).height(1.dp).background(primary.copy(alpha = 0.6f)))
-                if (bannerText!!.isNotBlank()) {
-                    Text(bannerText!!.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 14.dp).widthIn(max = 260.dp),
-                        style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 2.sp, fontWeight = FontWeight.SemiBold), color = primary)
-                    Box(Modifier.weight(1f).height(1.dp).background(primary.copy(alpha = 0.6f)))
+                Box(Modifier.width(if (named) 16.dp else 36.dp).height(1.dp).background(primary.copy(alpha = 0.55f)))
+                if (named) {
+                    Text(bannerText!!.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 10.dp).widthIn(max = if (landscape) 280.dp else 140.dp),
+                        style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 2.sp, fontWeight = FontWeight.SemiBold), color = primary)
+                    Box(Modifier.width(16.dp).height(1.dp).background(primary.copy(alpha = 0.55f)))
                 }
             }
         }
 
         // Undo sits just above the check button, for a few seconds after finishing a task.
         if (undoAlpha > 0.01f) {
-            Box(Modifier.align(Alignment.TopCenter).padding(top = (LocalConfiguration.current.screenHeightDp * 0.10f).dp)) {
+            Box(Modifier.align(Alignment.TopCenter).padding(top = maxOf((LocalConfiguration.current.screenHeightDp * 0.10f).dp, 64.dp, bannerTop + 32.dp))) {
                     Row(
                         modifier = Modifier.graphicsLayer { alpha = undoAlpha }.clip(CircleShape).background(MaterialTheme.colorScheme.surface)
                             .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
@@ -2039,15 +2187,22 @@ fun MeditationTimerPill(timer: MedTimer?, defaultMin: Int, onStart: (Int) -> Uni
     val primary = MaterialTheme.colorScheme.primary
     val onPrimary = MaterialTheme.colorScheme.onPrimary
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    val fg = MaterialTheme.colorScheme.onBackground
-    val chipBg = fg.copy(alpha = 0.12f)
+    // Day pages: black, but moderately dulled so the task title leads and the timer is a quiet add-on. Dark pages: white, with the accent while running.
+    val lightPage = MaterialTheme.colorScheme.background.luminance() > 0.5f
+    val base = MaterialTheme.colorScheme.onBackground
+    val fg = if (lightPage) base.copy(alpha = 0.62f) else base
+    val edgeIdle = base.copy(alpha = if (lightPage) 0.38f else 0.18f)
+    // While it runs the timer is the thing in use, so on day pages it is proper black; at rest it is the dulled add-on.
+    val inkRun = if (lightPage) base else primary
+    val edgeRun = if (lightPage) base else primary
+    val chipBg = fg.copy(alpha = 0.14f)
     var now by remember { mutableLongStateOf(android.os.SystemClock.elapsedRealtime()) }
     LaunchedEffect(timer?.endsAt, timer?.done) { while (timer != null && !timer.done) { now = android.os.SystemClock.elapsedRealtime(); delay(250) } }
     val label = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold, letterSpacing = 0.2.sp, fontFeatureSettings = "tnum")
     if (timer == null) {
         // One capsule: tap to start the default length (set in Settings).
         Row(
-            modifier = Modifier.height(52.dp).clip(CircleShape).border(1.5.dp, fg.copy(alpha = 0.18f), CircleShape)
+            modifier = Modifier.height(52.dp).clip(CircleShape).border(1.5.dp, edgeIdle, CircleShape)
                 .clickable { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.TIMER_START); onStart(defaultMin) }.padding(start = 18.dp, end = 24.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -2058,8 +2213,8 @@ fun MeditationTimerPill(timer: MedTimer?, defaultMin: Int, onStart: (Int) -> Uni
     } else {
         val done = timer.done
         // When it ends the capsule just settles from the accent to quiet white and grey over a couple of seconds. No fill, no flashing.
-        val edge by animateColorAsState(if (done) fg.copy(alpha = 0.18f) else primary, tween(2200), label = "medEdge")
-        val ink by animateColorAsState(if (done) fg else primary, tween(2200), label = "medInk")
+        val edge by animateColorAsState(if (done) edgeIdle else edgeRun, tween(2200), label = "medEdge")
+        val ink by animateColorAsState(if (done) fg else inkRun, tween(2200), label = "medInk")
         Row(
             modifier = Modifier.height(48.dp).clip(CircleShape).border(1.5.dp, edge, CircleShape).padding(start = 20.dp, end = 6.dp),
             verticalAlignment = Alignment.CenterVertically

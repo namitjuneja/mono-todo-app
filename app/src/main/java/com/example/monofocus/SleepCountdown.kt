@@ -30,7 +30,13 @@ private const val CHANNEL = "sleep_countdown_v3"
 private const val NOTIF_ID = 4201
 private val AppSurface = 0xFF0D0D0D.toInt()   // the app's OLED surface
 private val AppText = 0xFFF2F2F2.toInt()
-private val AppMuted = 0xFF8E8E93.toInt()
+private val AppDark = 0xFF0D0D0D.toInt()
+private val AppGlyphGrey = 0xFF8A8A90.toInt()
+private val AppWarmBlack = 0xFF241C00.toInt()
+private val StageTeal = 0xFF053837.toInt()
+private val StageMint = 0xFF00E092.toInt()
+private val StageBlack = 0xFF000000.toInt()
+private val StageBedOnTeal = 0xFFB5C6C5.toInt()   // a lighter bed so it still reads on the teal
 private val AppAccent = 0xFFFFEA00.toInt()     // the app's electric yellow
 
 fun sleepEnabled(context: Context): Boolean = context.getSharedPreferences("mono_prefs", Context.MODE_PRIVATE).getBoolean("sleep_on", false)
@@ -68,33 +74,29 @@ private fun buildSleepNotification(context: Context): Notification {
     }.timeInMillis
     val sinceMin = ((now - (next - 24L * 60 * 60 * 1000)) / 60_000L).toInt()
     val leftMinNow = if (sinceMin < 180) 0 else ((next - now + 59_999L) / 60_000L).toInt()
-    // Just the time left, with a bed glyph beside it. Once bedtime arrives it simply says so.
+    // Glyph on the left, time on the right.
     val title = if (sinceMin < 180) "Bedtime" else fmtSpan(((next - now + 59_999L) / 60_000L).toInt())
     val open = PendingIntent.getActivity(context, 0, Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-    // Numerals warm up gradually through the last three hours.
-    val ink = warmInk(leftMinNow)
+    // Four flat stages: black; deep teal from 3 hours out (yellow time, lighter bed); bright mint from 2 hours out (black time and bed); the app's yellow for the last hour.
+    val stage = if (leftMinNow > 180) 0 else if (leftMinNow > 120) 1 else if (leftMinNow > 60) 2 else 3
+    val cardColor = when (stage) { 0 -> AppSurface; 1 -> StageTeal; 2 -> StageMint; else -> AppAccent }
+    val ink = if (stage >= 2) StageBlack else AppAccent
+    val glyph = when (stage) { 0 -> AppGlyphGrey; 1 -> StageBedOnTeal; else -> StageBlack }
     fun views(layout: Int) = RemoteViews(context.packageName, layout).apply {
         setTextViewText(R.id.sleep_time, title); setTextColor(R.id.sleep_time, ink)
-        setInt(R.id.sleep_glyph, "setColorFilter", AppMuted)   // the glyph stays a quiet grey; only the numerals warm up
+        setInt(R.id.sleep_glyph, "setColorFilter", glyph)
     }
     return NotificationCompat.Builder(context, CHANNEL)
         .setSmallIcon(R.drawable.ic_stat_m)
         .setContentTitle(title)
         .setStyle(NotificationCompat.DecoratedCustomViewStyle())
         .setCustomContentView(views(R.layout.notif_sleep_collapsed))
-        .setCustomBigContentView(views(R.layout.notif_sleep_expanded))
-        .setColor(AppSurface).setColorized(true)
+        .setColor(cardColor).setColorized(true)
         .setOngoing(true).setOnlyAlertOnce(true).setShowWhen(false).setSilent(true)
         // Re-stamped every minute, so among equals it stays the newest and therefore the topmost.
         .setWhen(now).setSortKey("0")
         .setCategory(NotificationCompat.CATEGORY_STATUS).setVisibility(NotificationCompat.VISIBILITY_PUBLIC).setPriority(NotificationCompat.PRIORITY_HIGH)
         .setContentIntent(open).build()
-}
-
-/** The app's own off-white all evening. In the last 3 hours it drifts toward the app's yellow accent: a third of the way at 2h, two thirds at 1h, full accent at bedtime. */
-private fun warmInk(minutesLeft: Int): Int {
-    val t = (1f - minutesLeft.coerceIn(0, 180) / 180f)   // 0 at 3h left, 1 at bedtime
-    return ColorUtils.blendARGB(AppText, AppAccent, t)
 }
 
 /** "3h 20m", "3h", "45m". */
