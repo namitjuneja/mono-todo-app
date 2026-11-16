@@ -404,15 +404,27 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         }
     }
 
-    /** An empty separator slotted in right after [afterId]. */
+    /** The separator that was just created by a hold gesture; its row fades in instead of simply appearing. */
+    var freshSepId by androidx.compose.runtime.mutableStateOf<Long?>(null)
+
+    /** An empty separator slotted in right after [afterId], written once so it never flashes at the bottom first. */
     fun insertSeparatorAfter(afterId: Long) {
         viewModelScope.launch {
-            val order = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L
-            val newId = dao.insert(TaskEntity(title = "", queueOrder = order, playlist = _playlist.value, isSeparator = true))
-            val ids = todayList.value.map { it.id }.toMutableList()
-            val at = ids.indexOf(afterId)
-            ids.add(if (at >= 0) at + 1 else ids.size, newId)
-            dao.setOrders(ids)
+            val list = todayList.value
+            val at = list.indexOfFirst { it.id == afterId }
+            val lo = list.getOrNull(at)?.queueOrder
+            val hi = list.getOrNull(at + 1)?.queueOrder
+            if (lo != null && hi != null && hi - lo > 1) {
+                val id = dao.insert(TaskEntity(title = "", queueOrder = lo + (hi - lo) / 2, playlist = _playlist.value, isSeparator = true))
+                freshSepId = id
+            } else {
+                val order = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L
+                val newId = dao.insert(TaskEntity(title = "", queueOrder = order, playlist = _playlist.value, isSeparator = true))
+                freshSepId = newId
+                val ids = list.map { it.id }.toMutableList()
+                ids.add(if (at >= 0) at + 1 else ids.size, newId)
+                dao.setOrders(ids)
+            }
         }
     }
 
@@ -770,6 +782,40 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
             washBusy = false
         }
     }
+    // Settings always wear Main's colours. From Morning/Night the page washes to Main toward that list's button, and washes back out of it.
+    var settingsWashCenter by remember { mutableStateOf<Offset?>(null) }
+    fun openSettings(center: Offset) {
+        if (playlist == "main" || washBusy) { screen = ScreenState.SETTINGS; return }
+        settingsWashCenter = center
+        appScope.launch {
+            washBusy = true
+            washKey = playlist; washCenter = center
+            launch { contentAlpha.snapTo(0f); contentAlpha.animateTo(1f, tween(380, easing = FastOutSlowInEasing)) }
+            washReveal.snapTo(1.3f); washAlpha.snapTo(1f)
+            screen = ScreenState.SETTINGS
+            washReveal.animateTo(0f, tween(420, easing = FastOutSlowInEasing))
+            washAlpha.snapTo(0f)
+            washBusy = false
+        }
+    }
+    fun closeSettings() {
+        val c = settingsWashCenter
+        settingsWashCenter = null
+        if (playlist == "main" || c == null || washBusy) { screen = ScreenState.HOME; return }
+        appScope.launch {
+            washBusy = true
+            washKey = playlist; washCenter = c
+            launch { contentAlpha.snapTo(0f); contentAlpha.animateTo(1f, tween(380, easing = FastOutSlowInEasing)) }
+            washReveal.snapTo(0f); washAlpha.snapTo(1f)
+            bgKey = "main"
+            screen = ScreenState.HOME
+            washReveal.animateTo(1f, tween(420, easing = FastOutSlowInEasing))
+            bgKey = playlist
+            delay(160)
+            washAlpha.snapTo(0f)
+            washBusy = false
+        }
+    }
     LaunchedEffect(activeQueue) { updateAllWidgets(appContext) }
     // Morning clears at midnight and Night at 6 am (local time), whether the app was open or not.
     LaunchedEffect(Unit) { while (true) { applyDailyResets(appContext); delay(30_000) } }
@@ -914,10 +960,10 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     onReorder = viewModel::reorder,
                     onSelect = { t, y -> autoEye(); if (autoSelectId == null) sectionBanner = null; diceSession = false; focusedId = t.id; focusTitleY = y; returnId = null; autoSelectId = null; screen = ScreenState.FOCUS },
                     autoSelectId = autoSelectId,
-                    onOpenSettings = { returnId = null; screen = ScreenState.SETTINGS },
+                    onOpenSettings = { c -> returnId = null; openSettings(c) },
                     keepScreenOn = keepScreenOn, onToggleKeepScreenOn = { toggleKeepAwake() },
                     onArchiveAll = viewModel::archiveAll,
-                    onInsertAfter = viewModel::insertAfter, onInsertSeparatorAfter = viewModel::insertSeparatorAfter, onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
+                    onInsertAfter = viewModel::insertAfter, onInsertSeparatorAfter = viewModel::insertSeparatorAfter, freshSepId = viewModel.freshSepId, onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
                     playlist = playlist, onPlaylist = { k, c -> switchPlaylist(k, c) },
                     onRoll = { rollDice(null) },
                     onCleaningToggle = { c -> switchPlaylist(if (playlist == "cleaning") "main" else "cleaning", c) },
@@ -979,7 +1025,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     isDark = isOledDark, onDark = { if (it != isOledDark) onToggleTheme() },
                     onExport = { exportLauncher.launch("mono-backup-" + java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date()) + ".txt") },
                     onImport = { importLauncher.launch(arrayOf("text/plain", "application/octet-stream")) },
-                    onBack = { screen = ScreenState.HOME }
+                    onBack = { closeSettings() }
                 )
             }
         }
@@ -1078,8 +1124,8 @@ fun DoneOverlay(visible: Boolean, center: Offset) {
 fun HomeScreen(
     tasks: List<TaskEntity>, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions,
     onAddTasks: (String) -> Unit, onComplete: (TaskEntity) -> Unit, onUndoComplete: (TaskEntity) -> Unit,
-    onReorder: (List<TaskEntity>) -> Unit, onSelect: (TaskEntity, Float) -> Unit, onOpenSettings: () -> Unit, onArchiveAll: () -> Unit, onArchiveTask: (TaskEntity) -> Unit,
-    onInsertAfter: (Long, String) -> Unit, onInsertSeparatorAfter: (Long) -> Unit, onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
+    onReorder: (List<TaskEntity>) -> Unit, onSelect: (TaskEntity, Float) -> Unit, onOpenSettings: (Offset) -> Unit, onArchiveAll: () -> Unit, onArchiveTask: (TaskEntity) -> Unit,
+    onInsertAfter: (Long, String) -> Unit, onInsertSeparatorAfter: (Long) -> Unit, freshSepId: Long?, onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
     playlist: String, onPlaylist: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit,
     autoSelectId: Long?, returnId: Long?, returnY: Float, onReturnConsumed: () -> Unit,
     keepScreenOn: Boolean = false, onToggleKeepScreenOn: () -> Unit = {}
@@ -1166,6 +1212,11 @@ fun HomeScreen(
         val i = items.indexOfFirst { it.id == id }
         if (i >= 0) centerRow(i, id, force = true)
     }
+    // The gap that made room for a new separator closes the moment that separator's row exists (it fades in over the same space).
+    val freshHere = freshSepId != null && items.any { it.id == freshSepId }
+    LaunchedEffect(freshHere) { if (freshHere) { spreadAfterId = null; spreadAmount = 0f } }
+    // Safety: if the separator never shows up, don't leave the gap open.
+    LaunchedEffect(spreadAfterId, multiTouch) { if (spreadAfterId != null && !multiTouch) { delay(1500); if (!multiTouch) { spreadAfterId = null; spreadAmount = 0f } } }
     val spreadNeeded = remember(density) { with(density) { 52.dp.toPx() } }
     val spreadTol = remember(density) { with(density) { 12.dp.toPx() } }
     // One finger: press and hold on the seam between two tasks. Let go after a moment for a new to-do, keep holding for a separator.
@@ -1205,7 +1256,8 @@ fun HomeScreen(
                     while (true) {
                         val elapsed = android.os.SystemClock.uptimeMillis() - t0
                         if (elapsed >= 800L) { result = 2; break }
-                        spreadAmount = (elapsed / 260f).coerceIn(0f, 1f)
+                        spreadAmount = if (elapsed < 450L) (elapsed / 260f).coerceIn(0f, 1f)
+                            else 1f - 0.47f * ((elapsed - 450L) / 350f).coerceIn(0f, 1f)   // eases down to a separator's height
                         val e = withTimeoutOrNull(40L) { awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial) }
                         if (e != null) {
                             e.changes.forEach { it.consume() }
@@ -1216,7 +1268,7 @@ fun HomeScreen(
                         }
                     }
                     multiTouch = false
-                    spreadAfterId = null; spreadAmount = 0f
+                    if (result != 2) { spreadAfterId = null; spreadAmount = 0f }   // for a separator the gap stays until the row is there
                     if (result == 1) { triggerHaptic(context, HapticStyle.CONFIRM); gapAfterId = seam }
                     if (result == 2) { triggerHaptic(context, HapticStyle.CONFIRM); onInsertSeparatorAfter(seam); eatRest = true }
                 }
@@ -1255,7 +1307,7 @@ fun HomeScreen(
             override suspend fun onPreFling(available: androidx.compose.ui.unit.Velocity): androidx.compose.ui.unit.Velocity {
                 if (pull <= 0f) return androidx.compose.ui.unit.Velocity.Zero
                 val open = pull >= pullThreshold
-                if (open) { Sfx.play(Sound.TICK); onOpenSettings() }
+                if (open) { Sfx.play(Sound.TICK); onOpenSettings(glyphRowCenter + Offset(with(density) { 24.dp.toPx() } * (if (playlist == "morning") -1 else 1), 0f)) }
                 pullArmed = false
                 animate(pull, 0f, animationSpec = tween(240, easing = FastOutSlowInEasing)) { v, _ -> pull = v }
                 return available
@@ -1399,7 +1451,7 @@ fun HomeScreen(
                     }
                     if (task.isSeparator) {
                         SeparatorRow(
-                            task = task, isDragging = isDragging, modifier = rowModifier, hidden = selectingId != null,
+                            task = task, fresh = freshSepId == task.id, isDragging = isDragging, modifier = rowModifier, hidden = selectingId != null,
                             dragTranslation = dragTranslation, onEdit = { editingSeparator = task }, onDelete = { onDeleteSeparator(task) },
                             onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
                         )
@@ -1571,7 +1623,7 @@ fun SeparatorEditorSheet(task: TaskEntity, onSave: (String) -> Unit, onRemove: (
 /** A divider line with an optional label. Hold it to move it, tap to rename, swipe left to take it away. */
 @Composable
 fun SeparatorRow(
-    task: TaskEntity, isDragging: Boolean, hidden: Boolean, modifier: Modifier, dragTranslation: () -> Float,
+    task: TaskEntity, fresh: Boolean, isDragging: Boolean, hidden: Boolean, modifier: Modifier, dragTranslation: () -> Float,
     onEdit: () -> Unit, onDelete: () -> Unit, onDragStart: () -> Unit, onDrag: (Float) -> Unit, onDragEnd: () -> Unit
 ) {
     val context = LocalContext.current
@@ -1580,7 +1632,10 @@ fun SeparatorRow(
     val lightPage = MaterialTheme.colorScheme.background.luminance() > 0.5f
     val outline = if (lightPage) Color(0xFFB8B8BC) else Color.White.copy(alpha = 0.32f)
     val shape = RoundedCornerShape(16.dp)
-    val alpha by animateFloatAsState(if (hidden) 0f else 1f, tween(440, easing = FastOutSlowInEasing), label = "sepAlpha")
+    // A separator made by the hold gesture fades in where the gap opened.
+    var appeared by remember(task.id) { mutableStateOf(!fresh) }
+    LaunchedEffect(task.id) { appeared = true }
+    val alpha by animateFloatAsState(if (hidden || !appeared) 0f else 1f, tween(if (appeared && !hidden && fresh) 520 else 440, easing = FastOutSlowInEasing), label = "sepAlpha")
     val swipe = remember { Animatable(0f) }
     val threshold = with(LocalDensity.current) { 110.dp.toPx() }
     Row(

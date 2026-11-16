@@ -15,7 +15,7 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 - **Reorder** – hold a task anywhere and drag it up or down. There are no drag handles.
 - **Edit** – tap a task for title, notes, steps and timer count. Native copy and paste work. Enter saves and closes.
 - **Focus** – double-tap a task to start focus on it.
-- **Insert between two tasks** – press and hold on the line between two tasks. A thin accent line opens under your finger; let go after a moment for a blank row with the keyboard up (Enter saves it, leaving it empty drops it), or keep holding for about a second and an empty separator is added instead, with no editor popping up. A quick tap or scroll near a seam is left alone, and pressing on a separator itself still holds to move it.
+- **Insert between two tasks** – press and hold on the line between two tasks. A thin accent line opens under your finger; let go after a moment for a blank row with the keyboard up (Enter saves it, leaving it empty drops it), or keep holding for about a second: the rows below move down to make room, then an empty separator fades in there (no editor pops up). A quick tap or scroll near a seam is left alone, and pressing on a separator itself still holds to move it.
 - **Archive** – swipe left on a task, or archive the whole list from the top bar (it asks first).
 - **Nothing archives itself.**
 
@@ -62,7 +62,7 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 - **Send back** – the arrow returns a task to its list.
 
 ### Settings
-Pull the list down from the top to open them. Settings and Archive always use the Main list's colours, whichever list you came from.
+Pull the list down from the top to open them. Settings and Archive always use the Main list's colours, whichever list you came from. Opening them from Morning or Night washes the page to Main's colours toward that list's button, and going back washes the list's colour out from the same button.
 - **Archived notes** – opens the archive.
 - **Reset times** – when Morning and Night uncheck.
 - **Meditation timer length** – the default for the capsule.
