@@ -10,7 +10,7 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 
 ### Tasks
 - **Add** – type in the bar, one task per line. The + appears only when there is text.
-- **Complete** – check it off; it stays in place, dimmed.
+- **Complete** – check it off; it stays in place, dimmed. Morning separators are drawn in a soft grey so they stay quiet.
 - **Reorder** – drag the handle, up or down.
 - **Edit** – long-press for title, notes, steps and timer count. Native copy and paste work.
 - **Archive** – swipe left on a task, or archive the whole list from the top bar (it asks first).
@@ -28,7 +28,10 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 - **Steps** – show every step, or just the next one.
 - **Stuck menu** – try 2 minutes, break it into steps, or do something else first.
 - **Done** – a short win moment, then the next task opens.
-- **Undo** – floats near the top for a few seconds after finishing.
+- **Double-tap** – double-tap empty space on the list to start focus on the first open task.
+- **Landscape** – rotate for a flash-card view: the title is centred and large, steps are hidden.
+- **Undo** – floats 10% from the top for 3 seconds after finishing. Leaving focus or moving to another task dismisses it.
+- **Cleaning focus** – no stuck (?) button. Steps can be added in the editor only, not in focus.
 
 ### Timer
 - **2-minute timer** – start from the focus view.
@@ -63,8 +66,8 @@ Pull the list down from the top to open them.
 - **Import** – add the file to the end of your lists, or overwrite them.
 
 ### Phone
-- **Keep awake** – the eye icon keeps the screen on, but locks the phone behind it.
-- **Widgets** – a list widget (check and uncheck) and a focus widget; both update live.
+- **Keep awake (eye)** – keeps the screen on, but locks the phone behind it. It turns on by itself when you start a task in Morning or Night, and stays on when you go back to the list or other screens. Turn it off with the eye icon in focus, or the one in the list header.
+- **Widgets** – a list widget (check and uncheck, follows the open list) and a focus widget (always the Main list); both update live.
 
 ## Build
 
@@ -72,4 +75,4 @@ Pull the list down from the top to open them.
 gradle assembleDebug
 ```
 
-Requires the Android SDK (API 34) and Gradle 8.5; set `sdk.dir` in `local.properties`.
+Requires the Android SDK (API 34) and Gradle 8.5 (Gradle 9 does not work with the Android Gradle Plugin 8.2.2 used here; `./gradlew` just calls the system `gradle`); set `sdk.dir` in `local.properties`.

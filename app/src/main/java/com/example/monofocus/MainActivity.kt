@@ -34,6 +34,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.foundation.horizontalScroll
@@ -581,7 +582,7 @@ fun SystemBarsAndWakeEffect(immersiveFullScreen: Boolean, keepScreenOn: Boolean,
                 controller.show(WindowInsetsCompat.Type.systemBars())
             }
 
-            if (keepScreenOn && immersiveFullScreen) {
+            if (keepScreenOn) {
                 window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             } else {
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -611,7 +612,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
     var winCenter by remember { mutableStateOf(Offset.Zero) }
     var pendingUndo by remember { mutableStateOf<TaskEntity?>(null) }
     var autoSelectId by remember { mutableStateOf<Long?>(null) }
-    var keepScreenOn by remember { mutableStateOf(false) }
+    var keepScreenOn by rememberSaveable { mutableStateOf(false) }
 
     val activeQueue by viewModel.activeQueue.collectAsState()
     val todayList by viewModel.todayList.collectAsState()
@@ -780,6 +781,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
             wakeScreen(activity)     // bring the screen back; MONO shows over the lock screen
         }
     }
+    // Day and Night lists turn the eye on by themselves when a task is started.
     val adminLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         if (dpm.isAdminActive(adminComponent)) lockAndKeepAwake()
         else Toast.makeText(activity, "MONO needs that permission to lock the phone, so the screen was left alone.", Toast.LENGTH_LONG).show()
@@ -793,7 +795,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                 .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "MONO uses this only to lock your phone when you turn on \"keep screen on\", so the screen can stay lit without leaving your phone open.")
         )
     }
-    LaunchedEffect(screen) { if (screen != ScreenState.FOCUS) keepScreenOn = false }
+    fun autoEye() { if ((playlist == "morning" || playlist == "night") && !keepScreenOn) toggleKeepAwake() }
     LockedDisplayEffect(active = keepScreenOn)
     SystemBarsAndWakeEffect(immersiveFullScreen = (screen == ScreenState.FOCUS), keepScreenOn = keepScreenOn, isDark = (isOledDark && playlist != "morning") || playlist == "night" || playlist == "cleaning")
 
@@ -825,9 +827,14 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     onAddTasks = { viewModel.addTasks(it, "") },
                     onComplete = viewModel::completeTask, onUndoComplete = viewModel::undoCompleteTask, onArchiveTask = viewModel::archiveTask,
                     onReorder = viewModel::reorder,
-                    onSelect = { t, y -> diceSession = false; focusedId = t.id; focusTitleY = y; returnId = null; autoSelectId = null; screen = ScreenState.FOCUS },
+                    onSelect = { t, y -> autoEye(); diceSession = false; focusedId = t.id; focusTitleY = y; returnId = null; autoSelectId = null; screen = ScreenState.FOCUS },
                     autoSelectId = autoSelectId,
                     onOpenSettings = { returnId = null; screen = ScreenState.SETTINGS },
+                    keepScreenOn = keepScreenOn, onToggleKeepScreenOn = { toggleKeepAwake() },
+                    onStartFirst = {
+                        val first = todayList.firstOrNull { !it.isSeparator && !it.isCompleted }
+                        if (first != null) { autoEye(); diceSession = false; focusedId = first.id; focusTitleY = 420f; returnId = null; autoSelectId = null; screen = ScreenState.FOCUS }
+                    },
                     onArchiveAll = viewModel::archiveAll,
                     onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
                     playlist = playlist, onPlaylist = { k, c -> switchPlaylist(k, c) },
@@ -843,6 +850,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     onUndo = { t -> viewModel.undoCompleteTask(t); focusedId = t.id; pendingUndo = null },
                     onUndoDismiss = { pendingUndo = null },
                     onMoveToPrev = { t ->
+                        pendingUndo = null
                         val idx = focusSeq.indexOfFirst { it.id == t.id }
                         if (focusSeq.size > 1) {
                             val target = focusSeq[(idx - 1 + focusSeq.size) % focusSeq.size]
@@ -851,6 +859,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                         }
                     },
                     onMoveToNext = { t ->
+                        pendingUndo = null
                         if (diceSession) rollDice(t.id)
                         else {
                             val idx = focusSeq.indexOfFirst { it.id == t.id }
@@ -860,7 +869,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                             }
                         }
                     },
-                    onExitFocus = { returnId = if (diceSession) null else focusTask?.id; diceSession = false; screen = ScreenState.HOME }
+                    onExitFocus = { pendingUndo = null; returnId = if (diceSession) null else focusTask?.id; diceSession = false; screen = ScreenState.HOME }
                 )
                 ScreenState.ARCHIVE -> ArchiveScreen(
                     archivedTasks = archivedTasks, onRestore = viewModel::undoCompleteTask, onClearArchive = viewModel::clearArchive, onBack = { screen = ScreenState.SETTINGS }
@@ -979,7 +988,8 @@ fun HomeScreen(
     onReorder: (List<TaskEntity>) -> Unit, onSelect: (TaskEntity, Float) -> Unit, onOpenSettings: () -> Unit, onArchiveAll: () -> Unit, onArchiveTask: (TaskEntity) -> Unit,
     onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
     playlist: String, onPlaylist: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit,
-    autoSelectId: Long?, returnId: Long?, returnY: Float, onReturnConsumed: () -> Unit
+    autoSelectId: Long?, returnId: Long?, returnY: Float, onReturnConsumed: () -> Unit,
+    keepScreenOn: Boolean = false, onToggleKeepScreenOn: () -> Unit = {}, onStartFirst: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -1085,13 +1095,16 @@ fun HomeScreen(
                 }
             }
             Row {
+                if (keepScreenOn) IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); onToggleKeepScreenOn() }, modifier = Modifier.size(38.dp)) {
+                    Icon(Icons.Outlined.Visibility, contentDescription = "Eye is on. Tap to turn it off", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(19.dp))
+                }
                 IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); confirmArchiveAll = true }, enabled = items.any { !it.isSeparator } && selectingId == null, modifier = Modifier.size(38.dp)) {
                     Icon(Icons.Outlined.MoveToInbox, contentDescription = "Archive all", tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (items.isNotEmpty()) 0.6f else 0.25f), modifier = Modifier.size(19.dp))
                 }
             }
         }
 
-        Box(modifier = Modifier.weight(1f).fillMaxWidth().nestedScroll(pullConnection)) {
+        Box(modifier = Modifier.weight(1f).fillMaxWidth().nestedScroll(pullConnection).pointerInput(Unit) { detectTapGestures(onDoubleTap = { if (selectingId == null && draggingId == null) onStartFirst() }) }) {
             // The gear that rises out of the top edge while you pull.
             val reveal = (pull / pullThreshold).coerceIn(0f, 1f)
             if (reveal > 0.02f) Box(
@@ -1331,7 +1344,8 @@ fun SeparatorRow(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    val outline = MaterialTheme.colorScheme.outline
+    val lightPage = MaterialTheme.colorScheme.background.luminance() > 0.5f
+    val outline = if (lightPage) Color(0xFFB8B8BC) else MaterialTheme.colorScheme.outline
     val shape = RoundedCornerShape(16.dp)
     val alpha by animateFloatAsState(if (hidden) 0f else 1f, tween(440, easing = FastOutSlowInEasing), label = "sepAlpha")
     val swipe = remember { Animatable(0f) }
@@ -1371,7 +1385,7 @@ fun SeparatorRow(
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (task.title.isNotBlank()) {
-                Text(task.title.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.6.sp, fontWeight = FontWeight.Medium), color = muted.copy(alpha = 0.75f), modifier = Modifier.widthIn(max = 240.dp))
+                Text(task.title.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.6.sp, fontWeight = FontWeight.Medium), color = if (lightPage) Color(0xFF8A8A8F) else muted.copy(alpha = 0.75f), modifier = Modifier.widthIn(max = 240.dp))
                 Spacer(Modifier.width(12.dp))
             }
             Box(Modifier.weight(1f).height(1.dp).background(outline))
@@ -1544,8 +1558,7 @@ fun TaskRow(
             )
             val meta = listOfNotNull(
                 task.notes.takeIf { it.isNotBlank() },
-                if (subtasks.isNotEmpty()) "${subtasks.count { it.isDone }}/${subtasks.size} steps" else null,
-                if (task.playlist == "cleaning" && task.doneCount > 0) "done ${task.doneCount}×" else null
+                if (subtasks.isNotEmpty()) "${subtasks.count { it.isDone }}/${subtasks.size} steps" else null
             ).joinToString("  ·  ")
             if (meta.isNotEmpty()) {
                 Text(meta, style = MaterialTheme.typography.bodySmall, color = muted.copy(alpha = 0.7f), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.graphicsLayer { alpha = partsAlpha }.padding(top = 2.dp))
@@ -1600,7 +1613,8 @@ fun FocusScreen(
     var doneCenter by remember { mutableStateOf(Offset.Zero) }
     // A small Undo stays available for a few seconds once the next task has appeared.
     val undoAlpha by animateFloatAsState(if (undoTask != null) 1f else 0f, tween(250), label = "undoAlpha")
-    LaunchedEffect(undoTask) { if (undoTask != null) { delay(6000); onUndoDismiss() } }
+    LaunchedEffect(undoTask) { if (undoTask != null) { delay(3000); onUndoDismiss() } }
+    val landscape = LocalConfiguration.current.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
     val titleTopPad = with(LocalDensity.current) { (titleY.toDp() - 56.dp).coerceAtLeast(8.dp) }
 
     val startTimer = {
@@ -1689,7 +1703,7 @@ fun FocusScreen(
                 contentKey = { it?.id }, label = "FocusTask"
             ) { current ->
                 // Title sits at a fixed spot (FOCUS_TITLE_X / FOCUS_TITLE_Y from the window's top-left) so the list's text can glide onto it.
-                Box(modifier = Modifier.fillMaxSize().padding(start = 16.dp, end = 16.dp, top = titleTopPad), contentAlignment = Alignment.TopStart) {
+                Box(modifier = Modifier.fillMaxSize().padding(start = 16.dp, end = 16.dp, top = if (landscape) 0.dp else titleTopPad), contentAlignment = if (landscape) Alignment.Center else Alignment.TopStart) {
                     if (current == null) {
                         Column {
                             Icon(Icons.Default.Check, contentDescription = null, tint = primary, modifier = Modifier.size(32.dp))
@@ -1697,21 +1711,24 @@ fun FocusScreen(
                             Text("All done.", style = MaterialTheme.typography.headlineLarge.copy(fontSize = 34.sp, lineHeight = 42.sp, fontWeight = FontWeight.Medium), color = MaterialTheme.colorScheme.onBackground)
                         }
                     } else {
-                        Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                        Column(modifier = Modifier.verticalScroll(rememberScrollState()), horizontalAlignment = if (landscape) Alignment.CenterHorizontally else Alignment.Start) {
                             Text(
                                 current.title,
-                                style = MaterialTheme.typography.headlineLarge.copy(fontSize = 34.sp, lineHeight = 42.sp, fontWeight = FontWeight.Medium, letterSpacing = (-0.5).sp),
+                                textAlign = if (landscape) TextAlign.Center else TextAlign.Start,
+                                style = MaterialTheme.typography.headlineLarge.copy(fontSize = if (landscape) 56.sp else 34.sp, lineHeight = if (landscape) 68.sp else 42.sp, fontWeight = FontWeight.Medium, letterSpacing = (-0.5).sp),
                                 color = if (finishing) MaterialTheme.colorScheme.onBackground.copy(alpha = 0.3f) else MaterialTheme.colorScheme.onBackground,
                                 textDecoration = if (finishing) TextDecoration.LineThrough else TextDecoration.None,
                                 modifier = Modifier.graphicsLayer { alpha = titleAlpha }.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { showEditor = true }
                             )
                             if (current.notes.isNotBlank()) {
                                 Spacer(Modifier.height(16.dp))
-                                Text(current.notes, style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 26.sp), color = muted)
+                                Text(current.notes, textAlign = if (landscape) TextAlign.Center else TextAlign.Start, style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 26.sp), color = muted)
                             }
                             Spacer(Modifier.height(28.dp))
                             val subs = subtasksByTask[current.id].orEmpty()
-                            if (singleStep && subs.isNotEmpty()) {
+                            if (landscape) {
+                                // Flash-card view: just the big centred text.
+                            } else if (singleStep && subs.isNotEmpty()) {
                                 val next = subs.firstOrNull { !it.isDone }
                                 AnimatedContent(
                                     targetState = next, contentKey = { it?.id }, label = "NextStep",
@@ -1739,7 +1756,8 @@ fun FocusScreen(
                                     subtasks = subs,
                                     onToggle = { triggerHaptic(context, HapticStyle.TICK); editor.onToggleSub(it) },
                                     onDelete = null,
-                                    onAdd = { editor.onAddSub(current.id, it) }
+                                    onAdd = { editor.onAddSub(current.id, it) },
+                                    showAdd = false
                                 )
                             }
                         }
@@ -1749,10 +1767,12 @@ fun FocusScreen(
 
             if (task != null) {
                 Row(modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); showStuck = true }, modifier = Modifier.size(52.dp)) {
-                        Icon(Icons.Outlined.HelpOutline, contentDescription = "I'm stuck", tint = muted)
-                    }
-                    Spacer(Modifier.width(8.dp))
+                    if (!diceMode) {
+                        IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); showStuck = true }, modifier = Modifier.size(52.dp)) {
+                            Icon(Icons.Outlined.HelpOutline, contentDescription = "I'm stuck", tint = muted)
+                        }
+                        Spacer(Modifier.width(8.dp))
+                    } else Spacer(Modifier.width(60.dp))
                     val running = timerEnd != null
                     Box(
                         modifier = Modifier.size(52.dp).clip(CircleShape).clickable { if (running) timerEnd = null else startTimer() },
@@ -1808,7 +1828,7 @@ fun FocusScreen(
 
         // Undo sits just above the check button, for a few seconds after finishing a task.
         if (undoAlpha > 0.01f) {
-            Box(Modifier.align(Alignment.TopCenter).padding(top = (LocalConfiguration.current.screenHeightDp * 0.25f).dp)) {
+            Box(Modifier.align(Alignment.TopCenter).padding(top = (LocalConfiguration.current.screenHeightDp * 0.10f).dp)) {
                     Row(
                         modifier = Modifier.graphicsLayer { alpha = undoAlpha }.clip(CircleShape).background(MaterialTheme.colorScheme.surface)
                             .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
@@ -2046,7 +2066,7 @@ class EditorActions(
 @Composable
 fun SubtaskList(
     subtasks: List<SubtaskEntity>, onToggle: (SubtaskEntity) -> Unit, onDelete: ((SubtaskEntity) -> Unit)?,
-    onAdd: (String) -> Unit, modifier: Modifier = Modifier
+    onAdd: (String) -> Unit, modifier: Modifier = Modifier, showAdd: Boolean = true
 ) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val primary = MaterialTheme.colorScheme.primary
@@ -2074,7 +2094,7 @@ fun SubtaskList(
                 }
             }
         }
-        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (showAdd) Row(modifier = Modifier.fillMaxWidth().padding(vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Outlined.Add, contentDescription = null, tint = muted.copy(alpha = 0.7f), modifier = Modifier.size(20.dp))
             Spacer(Modifier.width(14.dp))
             BasicTextField(

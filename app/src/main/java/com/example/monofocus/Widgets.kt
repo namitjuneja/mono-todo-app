@@ -114,7 +114,7 @@ class CompleteTaskAction : ActionCallback {
     override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
         val id = parameters[TaskIdKey] ?: return
         val dao = AppDatabase.get(context).taskDao()
-        dao.getActiveOnce(currentPlaylist(context)).firstOrNull { it.id == id }?.let {
+        dao.getActiveOnce("main").firstOrNull { it.id == id }?.let {
             if (it.playlist == "cleaning") dao.markBankDone(it.id, System.currentTimeMillis())
             else dao.update(it.copy(isCompleted = true, completedAt = System.currentTimeMillis()))
         }
@@ -139,7 +139,7 @@ class NextTaskAction : ActionCallback {
         val id = parameters[TaskIdKey] ?: return
         val dao = AppDatabase.get(context).taskDao()
         val max = dao.getMaxQueueOrder() ?: System.currentTimeMillis()
-        dao.getActiveOnce(currentPlaylist(context)).firstOrNull { it.id == id }?.let { dao.update(it.copy(queueOrder = max + 10L)) }
+        dao.getActiveOnce("main").firstOrNull { it.id == id }?.let { dao.update(it.copy(queueOrder = max + 10L)) }
         updateAllWidgets(context)
     }
 }
@@ -198,10 +198,11 @@ class ListWidget : GlanceAppWidget() {
 class FocusWidget : GlanceAppWidget() {
     override suspend fun provideGlance(context: Context, id: GlanceId) {
         applyDailyResets(context)
-        val initial = listFlow(context, active = true).first()
+        val initial = AppDatabase.get(context).taskDao().getActiveQueue("main").first()
         val openApp = actionStartActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         provideContent {
-            val tasks by listFlow(context, active = true).collectAsState(initial)
+            // The focus widget always follows the Main list, whichever list is open in the app.
+            val tasks by AppDatabase.get(context).taskDao().getActiveQueue("main").collectAsState(initial)
             val current = tasks.firstOrNull()
             Column(
                 modifier = GlanceModifier.fillMaxSize().background(WBg).cornerRadius(24.dp).padding(16.dp)
