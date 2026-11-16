@@ -1399,7 +1399,7 @@ fun SeparatorRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Row(
-            modifier = Modifier.weight(1f).height(26.dp).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onEdit() }.padding(start = 20.dp, end = 14.dp),
+            modifier = Modifier.weight(1f).height(14.dp).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onEdit() }.padding(start = 20.dp, end = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (task.title.isNotBlank()) {
