@@ -8,7 +8,7 @@ import kotlin.math.exp
 import kotlin.math.min
 import kotlin.math.sin
 
-enum class Sound { TICK, ADD, CHECK, UNDO, WIN, TIMER_START, TIMER_DONE, SWEEP }
+enum class Sound { TICK, ADD, CHECK, UNDO, WIN, TIMER_START, TIMER_DONE, SWEEP, BELL }
 
 /**
  * Small, soft tones generated in code (no audio files). Played as UI "sonification", so they follow the
@@ -29,6 +29,8 @@ object Sfx {
         Sound.WIN -> listOf(Part(523.0, 0, 280, 0.19, 10.0), Part(659.0, 110, 280, 0.19, 10.0), Part(784.0, 220, 420, 0.19, 8.0), Part(1047.0, 330, 520, 0.11, 8.0))
         Sound.TIMER_START -> listOf(Part(520.0, 0, 90, 0.15, 50.0))
         Sound.TIMER_DONE -> listOf(Part(784.0, 0, 720, 0.19, 6.0), Part(1176.0, 0, 520, 0.09, 8.0), Part(988.0, 360, 720, 0.16, 6.0))
+        // A soft bell: a low fundamental with inharmonic overtones that die away at different rates.
+        Sound.BELL -> listOf(Part(392.0, 0, 2600, 0.22, 1.7), Part(392.0 * 2.76, 0, 1600, 0.09, 3.0), Part(392.0 * 5.4, 0, 900, 0.04, 5.5), Part(392.0 * 0.5, 0, 2600, 0.10, 1.4))
         Sound.SWEEP -> listOf(Part(880.0, 0, 80, 0.13, 30.0), Part(659.0, 60, 80, 0.13, 30.0), Part(494.0, 120, 170, 0.13, 22.0))
     }
 

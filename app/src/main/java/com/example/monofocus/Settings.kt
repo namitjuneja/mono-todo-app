@@ -13,6 +13,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.ArrowBackIosNew
+import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Remove
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.*
@@ -134,6 +136,8 @@ fun SettingsScreen(
     morningMin: Int, nightMin: Int, onMorningMin: (Int) -> Unit, onNightMin: (Int) -> Unit,
     autoNext: Boolean, onAutoNext: (Boolean) -> Unit, stopAtSep: Boolean, onStopAtSep: (Boolean) -> Unit,
     soundOn: Boolean, onSound: (Boolean) -> Unit, hapticsOn: Boolean, onHaptics: (Boolean) -> Unit,
+    medDefault: Int, onMedDefault: (Int) -> Unit,
+    sleepOn: Boolean, sleepMin: Int, onSleepOn: (Boolean) -> Unit, onSleepMin: (Int) -> Unit,
     isDark: Boolean, onDark: (Boolean) -> Unit,
     onExport: () -> Unit, onImport: () -> Unit, onBack: () -> Unit
 ) {
@@ -161,6 +165,23 @@ fun SettingsScreen(
                 SettingRow("Stop at separators", "Return to the list at a separator instead of skipping it", onClick = if (autoNext) ({ onStopAtSep(!stopAtSep) }) else null) { QuietCheck(stopAtSep, onStopAtSep, enabled = autoNext) }
             }
 
+            SectionLabel("Meditation")
+            SettingRow("Timer length", "Default for the timer on meditate and focus tasks") {
+                val steps = listOf(2, 3, 5, 10, 15, 20, 30, 45, 60)
+                val i = steps.indexOf(medDefault).let { if (it >= 0) it else steps.indexOfLast { s -> s <= medDefault }.coerceAtLeast(0) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { if (i > 0) onMedDefault(steps[i - 1]) }, enabled = i > 0) { Icon(Icons.Outlined.Remove, contentDescription = "Shorter", tint = if (i > 0) MaterialTheme.colorScheme.primary else muted.copy(alpha = 0.3f)) }
+                    Text("$medDefault min", style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.SemiBold), color = MaterialTheme.colorScheme.onBackground, modifier = Modifier.widthIn(min = 64.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                    IconButton(onClick = { if (i < steps.lastIndex) onMedDefault(steps[i + 1]) }, enabled = i < steps.lastIndex) { Icon(Icons.Outlined.Add, contentDescription = "Longer", tint = if (i < steps.lastIndex) MaterialTheme.colorScheme.primary else muted.copy(alpha = 0.3f)) }
+                }
+            }
+
+            SectionLabel("Sleep")
+            SettingRow("Sleep countdown", "A quiet notification, on the lock screen too, showing the time left until bed", onClick = { onSleepOn(!sleepOn) }) { QuietCheck(sleepOn, onSleepOn) }
+            Box(Modifier.alpha(if (sleepOn) 1f else 0.4f)) {
+                SettingRow("Sleep time", "When the countdown reaches zero") { TimePill(formatMinutes(context, sleepMin)) { if (sleepOn) editing = "sleep" } }
+            }
+
             SectionLabel("Feedback")
             SettingRow("Sound", onClick = { onSound(!soundOn) }) { QuietCheck(soundOn, onSound) }
             SettingRow("Haptics", onClick = { onHaptics(!hapticsOn) }) { QuietCheck(hapticsOn, onHaptics) }
@@ -176,9 +197,9 @@ fun SettingsScreen(
 
     editing?.let { which ->
         TimeDialog(
-            initialMinutes = if (which == "morning") morningMin else nightMin,
-            title = if (which == "morning") "Day tasks reset at" else "Night tasks reset at",
-            onDone = { m -> if (which == "morning") onMorningMin(m) else onNightMin(m); editing = null },
+            initialMinutes = when (which) { "morning" -> morningMin; "sleep" -> sleepMin; else -> nightMin },
+            title = when (which) { "morning" -> "Day tasks reset at"; "sleep" -> "Sleep time"; else -> "Night tasks reset at" },
+            onDone = { m -> when (which) { "morning" -> onMorningMin(m); "sleep" -> onSleepMin(m); else -> onNightMin(m) }; editing = null },
             onDismiss = { editing = null }
         )
     }

@@ -43,6 +43,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.BasicTextField
@@ -71,6 +72,7 @@ import androidx.compose.material.icons.filled.Casino
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.WbTwilight
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -298,7 +300,8 @@ abstract class AppDatabase : RoomDatabase() {
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class TaskViewModel(private val dao: TaskDao, private val prefs: android.content.SharedPreferences) : ViewModel() {
-    private val _playlist = kotlinx.coroutines.flow.MutableStateFlow(prefs.getString("playlist", "main") ?: "main")
+    // A fresh start always opens on the Main list.
+    private val _playlist = kotlinx.coroutines.flow.MutableStateFlow("main").also { prefs.edit().putString("playlist", "main").apply() }
     val playlist: StateFlow<String> = _playlist
 
     fun setPlaylist(key: String) {
@@ -528,7 +531,7 @@ private val CleanLightScheme = lightColorScheme(
 fun MonoFocusTheme(isDark: Boolean, playlist: String = "main", content: @Composable () -> Unit) {
     val scheme = when (playlist) {
         // Morning flips to a light page with dark text; the soft gradient is drawn behind it.
-        "morning" -> CleanLightScheme.copy(background = Color(0xFFFFF9EC), surface = Color(0xFFFFFFFF), onBackground = Color(0xFF111111), onSurface = Color(0xFF111111))
+        "morning" -> CleanLightScheme.copy(background = Color(0xFFFFF0A3), surface = Color(0xFFFFFFFF), onBackground = Color(0xFF111111), onSurface = Color(0xFF111111))
         "night", "cleaning" -> OledDarkScheme
         else -> if (isDark) OledDarkScheme else CleanLightScheme
     }
@@ -614,6 +617,23 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
     var pendingUndo by remember { mutableStateOf<TaskEntity?>(null) }
     var autoSelectId by remember { mutableStateOf<Long?>(null) }
     var keepScreenOn by rememberSaveable { mutableStateOf(false) }
+    // Set when finishing a task carries focus into a new section: the separator title ("" when it has none), shown briefly on the next task.
+    var sectionBanner by remember { mutableStateOf<String?>(null) }
+    // A meditation/focus timer lives here so it keeps running (and rings) wherever you are in the app.
+    var medTimer by remember { mutableStateOf<MedTimer?>(null) }
+    val bellCtx = androidx.compose.ui.platform.LocalContext.current
+    LaunchedEffect(medTimer?.endsAt, medTimer?.done) {
+        val t = medTimer ?: return@LaunchedEffect
+        if (t.done) return@LaunchedEffect
+        val wait = t.endsAt - android.os.SystemClock.elapsedRealtime()
+        if (wait > 0) delay(wait)
+        medTimer = t.copy(done = true)
+        repeat(3) { i ->
+            if (i > 0) delay(3200)
+            triggerHaptic(bellCtx, HapticStyle.CONFIRM)
+            Sfx.play(Sound.BELL)
+        }
+    }
 
     val activeQueue by viewModel.activeQueue.collectAsState()
     val todayList by viewModel.todayList.collectAsState()
@@ -638,6 +658,14 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
     var stopAtSep by remember { mutableStateOf(uiPrefs.getBoolean("stop_at_separator", true)) }
     var morningMin by remember { mutableIntStateOf(resetMinutes(appContext, "morning")) }
     var nightMin by remember { mutableIntStateOf(resetMinutes(appContext, "night")) }
+    var medDefault by remember { mutableIntStateOf(uiPrefs.getInt("med_default", 5)) }
+    var sleepOn by remember { mutableStateOf(sleepEnabled(appContext)) }
+    var sleepMin by remember { mutableIntStateOf(sleepMinutes(appContext)) }
+    fun applySleep(on: Boolean) { sleepOn = on; setSleepEnabled(appContext, on); syncSleepNotification(appContext) }
+    val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) applySleep(true) else Toast.makeText(appContext, "Allow notifications to see the sleep countdown.", Toast.LENGTH_LONG).show()
+    }
+    LaunchedEffect(Unit) { syncSleepNotification(appContext) }
     var importPending by remember { mutableStateOf<Backup.Parsed?>(null) }
     var confirmReplace by remember { mutableStateOf(false) }
     val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
@@ -752,18 +780,22 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
             // The very next thing in the list, even if it is a separator: focus always pauses there.
             // Unless Settings says otherwise: with "stop at separators" off, auto-start skips over them.
             val following = focusSeq.drop(focusSeq.indexOfFirst { it.id == task.id } + 1)
-            val after = if (stopAtSep) following.firstOrNull() else following.firstOrNull { !it.isSeparator }
+            // Morning and Night always carry on into the next section (with a banner); elsewhere Settings decides.
+            val crossSep = !stopAtSep || task.playlist == "morning" || task.playlist == "night"
+            val after = if (crossSep) following.firstOrNull { !it.isSeparator } else following.firstOrNull()
             val next = (after ?: activeQueue.getOrNull(idx - 1))?.takeIf { it.id != task.id }
+            val enteredSep = if (crossSep && after != null) following.takeWhile { it.id != after.id }.lastOrNull { it.isSeparator } else null
             viewModel.completeTask(task)
             pendingUndo = task
             returnId = null
+            sectionBanner = null
             focusedId = if (autoNext && next?.isSeparator != true) next?.id else null
             screen = ScreenState.HOME
             delay(1600)
             winVisible = false
             delay(650) // let the list show for a beat, with the finished task dimmed in place
             if (!autoNext) { /* back on the list; nothing opens by itself */ }
-            else if (next?.isSeparator != true) autoSelectId = next?.id
+            else if (next?.isSeparator != true) { autoSelectId = next?.id; if (enteredSep != null) sectionBanner = enteredSep.title.trim() }
             delay(20000)
             if (pendingUndo?.id == task.id) pendingUndo = null
         }
@@ -773,14 +805,30 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
     val activity = appContext as Activity
     val adminComponent = remember { ComponentName(activity, MonoAdminReceiver::class.java) }
     val dpm = remember { activity.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager }
+    var locking by remember { mutableStateOf(false) }
     fun lockAndKeepAwake() {
+        if (locking) return
         appScope.launch {
+            locking = true
             keepScreenOn = true      // flags: stay on + draw above the lock screen
             delay(250)
             dpm.lockNow()            // the phone is now genuinely locked
             delay(700)
             wakeScreen(activity)     // bring the screen back; MONO shows over the lock screen
+            delay(2500)              // ignore the resume this very wake-up causes
+            locking = false
         }
+    }
+    // Eye on but the phone got unlocked (e.g. you left and came back): lock it again.
+    val keyguard = remember { activity.getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager }
+    val eyeOn by rememberUpdatedState(keepScreenOn)
+    DisposableEffect(activity) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME && eyeOn && !locking && dpm.isAdminActive(adminComponent) && !keyguard.isKeyguardLocked) lockAndKeepAwake()
+        }
+        val owner = activity as androidx.activity.ComponentActivity
+        owner.lifecycle.addObserver(obs)
+        onDispose { owner.lifecycle.removeObserver(obs) }
     }
     // Day and Night lists turn the eye on by themselves when a task is started.
     val adminLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -798,7 +846,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
     }
     fun autoEye() { if ((playlist == "morning" || playlist == "night") && !keepScreenOn) toggleKeepAwake() }
     LockedDisplayEffect(active = keepScreenOn)
-    SystemBarsAndWakeEffect(immersiveFullScreen = (screen == ScreenState.FOCUS), keepScreenOn = keepScreenOn, isDark = (isOledDark && playlist != "morning") || playlist == "night" || playlist == "cleaning")
+    SystemBarsAndWakeEffect(immersiveFullScreen = (screen == ScreenState.FOCUS), keepScreenOn = keepScreenOn || medTimer?.done == false, isDark = (isOledDark && playlist != "morning") || playlist == "night" || playlist == "cleaning")
 
     MonoFocusTheme(isDark = isOledDark, playlist = if (diceSession && screen == ScreenState.FOCUS) "cleaning" else playlist) {
     // The page base follows bgKey (not the live theme), so the old colour holds until the wash has covered it.
@@ -828,7 +876,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     onAddTasks = { viewModel.addTasks(it, "") },
                     onComplete = viewModel::completeTask, onUndoComplete = viewModel::undoCompleteTask, onArchiveTask = viewModel::archiveTask,
                     onReorder = viewModel::reorder,
-                    onSelect = { t, y -> autoEye(); diceSession = false; focusedId = t.id; focusTitleY = y; returnId = null; autoSelectId = null; screen = ScreenState.FOCUS },
+                    onSelect = { t, y -> autoEye(); if (autoSelectId == null) sectionBanner = null; diceSession = false; focusedId = t.id; focusTitleY = y; returnId = null; autoSelectId = null; screen = ScreenState.FOCUS },
                     autoSelectId = autoSelectId,
                     onOpenSettings = { returnId = null; screen = ScreenState.SETTINGS },
                     keepScreenOn = keepScreenOn, onToggleKeepScreenOn = { toggleKeepAwake() },
@@ -840,7 +888,11 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     returnId = returnId, returnY = focusTitleY, onReturnConsumed = { returnId = null }
                 )
                 ScreenState.FOCUS -> FocusScreen(
-                    task = focusTask, position = focusIndex + 1, titleY = focusTitleY, subtasksByTask = subtasksByTask, editor = editor, onFocusSession = viewModel::addFocusSession, remainingCount = if (diceSession) 2 else focusSeq.size, diceMode = diceSession, morphFromList = !diceSession, keepScreenOn = keepScreenOn,
+                    task = focusTask, position = focusIndex + 1, titleY = focusTitleY, subtasksByTask = subtasksByTask, editor = editor, onFocusSession = viewModel::addFocusSession, remainingCount = if (diceSession) 2 else focusSeq.size, diceMode = diceSession, morphFromList = !diceSession, keepScreenOn = keepScreenOn, sectionBanner = sectionBanner, onBannerDone = { sectionBanner = null },
+                    medTimer = medTimer, medDefault = medDefault,
+                    onMedStart = { min -> medTimer = MedTimer(focusedId ?: 0L, min * 60, android.os.SystemClock.elapsedRealtime() + min * 60_000L, false) },
+                    onMedAdd = { sec -> medTimer = medTimer?.let { m -> if (m.done) m.copy(total = sec, endsAt = android.os.SystemClock.elapsedRealtime() + sec * 1000L, done = false) else m.copy(total = m.total + sec, endsAt = m.endsAt + sec * 1000L) } },
+                    onMedClear = { medTimer = null },
                     onToggleKeepScreenOn = { toggleKeepAwake() },
                     onFinish = { t, c -> finishTask(t, c) },
                     undoTask = pendingUndo,
@@ -880,6 +932,13 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     stopAtSep = stopAtSep, onStopAtSep = { stopAtSep = it; uiPrefs.edit().putBoolean("stop_at_separator", it).apply() },
                     soundOn = soundOn, onSound = { soundOn = it; Sfx.enabled = it; uiPrefs.edit().putBoolean("sounds", it).apply(); if (it) Sfx.play(Sound.TICK) },
                     hapticsOn = hapticsOn, onHaptics = { hapticsOn = it; Haptics.enabled = it; uiPrefs.edit().putBoolean("haptics", it).apply(); if (it) triggerHaptic(appContext, HapticStyle.TICK) },
+                    medDefault = medDefault, onMedDefault = { medDefault = it; uiPrefs.edit().putInt("med_default", it).apply() },
+                    sleepOn = sleepOn, sleepMin = sleepMin,
+                    onSleepOn = { on ->
+                        if (on && Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(appContext, android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                        else applySleep(on)
+                    },
+                    onSleepMin = { sleepMin = it; setSleepMinutes(appContext, it); syncSleepNotification(appContext) },
                     isDark = isOledDark, onDark = { if (it != isOledDark) onToggleTheme() },
                     onExport = { exportLauncher.launch("mono-backup-" + java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date()) + ".txt") },
                     onImport = { importLauncher.launch(arrayOf("text/plain", "application/octet-stream")) },
@@ -1017,11 +1076,26 @@ fun HomeScreen(
     var dragStartOffset by remember { mutableIntStateOf(0) }
     LaunchedEffect(tasks) { if (draggingId == null) { items.clear(); items.addAll(tasks) } }
     // After finishing a task the next one is opened automatically; make sure its row is on screen first.
+    // The row is brought to the middle of the visible area (above the dock) first; only then does it start growing into focus.
+    var readyId by remember { mutableStateOf<Long?>(null) }
+    suspend fun centerRow(i: Int, id: Long) {
+        val dockPx = with(density) { dockH.toPx() }
+        fun info() = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == id }
+        val viewH = listState.layoutInfo.viewportSize.height.toFloat()
+        val topEdge = with(density) { 8.dp.toPx() }
+        val bottomEdge = viewH - dockPx
+        val target = (topEdge + bottomEdge) / 2f
+        var it0 = info()
+        val fullyVisible = it0 != null && it0.offset >= topEdge && it0.offset + it0.size <= bottomEdge
+        if (fullyVisible) return
+        if (it0 == null) { listState.scrollToItem(i); it0 = info() ?: return; listState.scrollBy(it0.offset + it0.size / 2f - target) }
+        else listState.animateScrollBy(it0.offset + it0.size / 2f - target, tween(320, easing = FastOutSlowInEasing))
+        delay(60)
+    }
     LaunchedEffect(autoSelectId, items.size) {
-        if (autoSelectId != null) {
-            val i = items.indexOfFirst { it.id == autoSelectId }
-            if (i >= 0 && listState.layoutInfo.visibleItemsInfo.none { it.key == autoSelectId }) listState.scrollToItem(i)
-        }
+        if (autoSelectId == null) { readyId = null; return@LaunchedEffect }
+        val i = items.indexOfFirst { it.id == autoSelectId }
+        if (i >= 0 && readyId != autoSelectId) { centerRow(i, autoSelectId); readyId = autoSelectId }
     }
 
     // Pull the list down from the top to open Settings. A gear fades in as you pull and clicks in when you can let go.
@@ -1067,7 +1141,7 @@ fun HomeScreen(
         val i = items.indexOfFirst { !it.isSeparator && !it.isCompleted }
         if (i < 0) return
         val id = items[i].id
-        if (listState.layoutInfo.visibleItemsInfo.none { it.key == id }) scope.launch { listState.scrollToItem(i); quickId = id } else quickId = id
+        scope.launch { centerRow(i, id); quickId = id }
     }
 
     // On Morning / Night / Cleaning, Back returns to Main instead of leaving the app.
@@ -1202,7 +1276,7 @@ fun HomeScreen(
                         modifier = rowModifier,
                         selection = when (selectingId) { null -> 0; task.id -> 2; else -> 1 },
                         focusX = focusX, minY = minY, maxY = maxY, morphY = morphY,
-                        autoSelect = autoSelectId == task.id || quickId == task.id,
+                        autoSelect = (autoSelectId == task.id && readyId == task.id) || quickId == task.id,
                         onSelect = { y ->
                             if (selectingId == null && draggingId == null && !task.isCompleted) {
                                 quickId = null
@@ -1217,6 +1291,7 @@ fun HomeScreen(
                         dragTranslation = dragTranslation,
                         onCheck = { if (task.isCompleted) onUndoComplete(task) else onComplete(task) },
                         onArchive = { onArchiveTask(task) },
+                        onToggleSub = editor.onToggleSub,
                         onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
                     )
                 }
@@ -1363,7 +1438,7 @@ fun SeparatorRow(
     val scope = rememberCoroutineScope()
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val lightPage = MaterialTheme.colorScheme.background.luminance() > 0.5f
-    val outline = if (lightPage) Color(0xFFB8B8BC) else MaterialTheme.colorScheme.outline
+    val outline = if (lightPage) Color(0xFFB8B8BC) else Color.White.copy(alpha = 0.32f)
     val shape = RoundedCornerShape(16.dp)
     val alpha by animateFloatAsState(if (hidden) 0f else 1f, tween(440, easing = FastOutSlowInEasing), label = "sepAlpha")
     val swipe = remember { Animatable(0f) }
@@ -1395,7 +1470,9 @@ fun SeparatorRow(
                 )
             }
             .graphicsLayer { translationX = swipe.value; translationY = if (isDragging) dragTranslation() else 0f; this.alpha = alpha * (1f + swipe.value / (size.width.coerceAtLeast(1f))).coerceIn(0f, 1f) }
-            .then(if (isDragging) Modifier.shadow(12.dp, shape).background(MaterialTheme.colorScheme.surface, shape) else Modifier),
+            // The lifted card (while moving or sliding away) includes the breathing room above and below the line.
+            .then(if (isDragging) Modifier.shadow(12.dp, shape).background(MaterialTheme.colorScheme.surface, shape) else if (swipe.value < -1f) Modifier.background(MaterialTheme.colorScheme.surface, shape) else Modifier)
+            .padding(vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Row(
@@ -1453,7 +1530,7 @@ val FOCUS_TITLE_X = 28.dp
 @Composable
 fun TaskRow(
     task: TaskEntity, subtasks: List<SubtaskEntity>, onOpen: () -> Unit, onSelect: (Float) -> Unit, autoSelect: Boolean, selection: Int, focusX: Float, minY: Float, maxY: Float, morphY: Float, isDragging: Boolean, modifier: Modifier,
-    dragTranslation: () -> Float, onCheck: () -> Unit, onArchive: () -> Unit,
+    dragTranslation: () -> Float, onCheck: () -> Unit, onArchive: () -> Unit, onToggleSub: (SubtaskEntity) -> Unit,
     onDragStart: () -> Unit, onDrag: (Float) -> Unit, onDragEnd: () -> Unit
 ) {
     val context = LocalContext.current
@@ -1536,7 +1613,8 @@ fun TaskRow(
             .graphicsLayer { translationX = swipe.value; translationY = if (isDragging) dragTranslation() else 0f; alpha = rowAlpha * (1f - archivePop.value * 0.85f) * (1f - (-swipe.value / (size.width.coerceAtLeast(1f))).coerceIn(0f, 1f) * 0.5f) }
             .then(if (isDragging) Modifier.shadow(12.dp, shape).background(surface, shape) else Modifier)
             .padding(start = 8.dp),
-        verticalAlignment = Alignment.CenterVertically
+        // Top-aligned: the check box and drag handle stay level with the title line, however many steps sit below it.
+        verticalAlignment = Alignment.Top
     ) {
         Box(
             modifier = Modifier.graphicsLayer { alpha = partsAlpha }.size(48.dp).clip(CircleShape).clickable(enabled = selection == 0) {
@@ -1576,10 +1654,34 @@ fun TaskRow(
             )
             val meta = listOfNotNull(
                 task.notes.takeIf { it.isNotBlank() },
-                if (subtasks.isNotEmpty()) "${subtasks.count { it.isDone }}/${subtasks.size} steps" else null
+                null
             ).joinToString("  ·  ")
             if (meta.isNotEmpty()) {
                 Text(meta, style = MaterialTheme.typography.bodySmall, color = muted.copy(alpha = 0.7f), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.graphicsLayer { alpha = partsAlpha }.padding(top = 2.dp))
+            }
+            if (subtasks.isNotEmpty()) Column(Modifier.graphicsLayer { alpha = partsAlpha }.padding(top = 4.dp)) {
+                subtasks.forEach { sub ->
+                    key(sub.id) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable(enabled = selection == 0) {
+                                triggerHaptic(context, HapticStyle.TICK); Sfx.play(if (sub.isDone) Sound.UNDO else Sound.CHECK); onToggleSub(sub)
+                            }.padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier.size(16.dp).clip(RoundedCornerShape(5.dp)).background(if (sub.isDone) muted.copy(alpha = 0.35f) else Color.Transparent)
+                                    .then(if (sub.isDone) Modifier else Modifier.border(1.3.dp, muted.copy(alpha = 0.6f), RoundedCornerShape(5.dp))),
+                                contentAlignment = Alignment.Center
+                            ) { if (sub.isDone) Icon(Icons.Default.Check, contentDescription = null, tint = MaterialTheme.colorScheme.background, modifier = Modifier.size(11.dp)) }
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                sub.title, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f),
+                                color = if (sub.isDone) muted.copy(alpha = 0.45f) else onBg.copy(alpha = 0.8f),
+                                textDecoration = if (sub.isDone) TextDecoration.LineThrough else TextDecoration.None
+                            )
+                        }
+                    }
+                }
             }
             if (task.focusSessions > 0) TimerBadgesFit(task.focusSessions, size = 20.dp, modifier = Modifier.graphicsLayer { alpha = partsAlpha }.padding(top = 6.dp))
         }
@@ -1602,7 +1704,7 @@ fun TaskRow(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FocusScreen(
-    task: TaskEntity?, position: Int, titleY: Float, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions, onFocusSession: (Long) -> Unit, remainingCount: Int, diceMode: Boolean, morphFromList: Boolean, keepScreenOn: Boolean, onToggleKeepScreenOn: () -> Unit,
+    task: TaskEntity?, position: Int, titleY: Float, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions, onFocusSession: (Long) -> Unit, remainingCount: Int, diceMode: Boolean, morphFromList: Boolean, keepScreenOn: Boolean, sectionBanner: String?, onBannerDone: () -> Unit, medTimer: MedTimer?, medDefault: Int, onMedStart: (Int) -> Unit, onMedAdd: (Int) -> Unit, onMedClear: () -> Unit, onToggleKeepScreenOn: () -> Unit,
     onFinish: (TaskEntity, Offset) -> Unit, undoTask: TaskEntity?, onUndo: (TaskEntity) -> Unit, onUndoDismiss: () -> Unit, onMoveToNext: (TaskEntity) -> Unit, onMoveToPrev: (TaskEntity) -> Unit,
     onExitFocus: () -> Unit
 ) {
@@ -1633,6 +1735,9 @@ fun FocusScreen(
     val undoAlpha by animateFloatAsState(if (undoTask != null) 1f else 0f, tween(250), label = "undoAlpha")
     LaunchedEffect(undoTask) { if (undoTask != null) { delay(3000); onUndoDismiss() } }
     val landscape = LocalConfiguration.current.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    // Done is a wide pill: a big, easy target without a block of colour in the middle of the screen.
+    val doneW = if (landscape) 168.dp else 116.dp
+    val doneH = if (landscape) 80.dp else 64.dp
     val titleTopPad = with(LocalDensity.current) { (titleY.toDp() - 56.dp).coerceAtLeast(8.dp) }
 
     val startTimer = {
@@ -1778,13 +1883,19 @@ fun FocusScreen(
                                     showAdd = false
                                 )
                             }
+                            if (wantsMedTimer(current) || medTimer?.taskId == current.id) {
+                                Spacer(Modifier.height(24.dp))
+                                MeditationTimerPill(medTimer?.takeIf { it.taskId == current.id }, medDefault, onMedStart, onMedAdd, onMedClear)
+                            }
                         }
                     }
                 }
             }
 
             if (task != null) {
-                Row(modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                Row(modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+                    // Helpers on the left and the next arrow on the right share the leftover width, so the pill stays centred.
+                    Row(Modifier.weight(1f), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
                     if (!diceMode) {
                         IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); showStuck = true }, modifier = Modifier.size(52.dp)) {
                             Icon(Icons.Outlined.HelpOutline, contentDescription = "I'm stuck", tint = muted)
@@ -1803,9 +1914,10 @@ fun FocusScreen(
                             Icon(Icons.Outlined.Timer, contentDescription = "Start 2-minute timer", tint = muted)
                         }
                     }
-                    Spacer(Modifier.width(12.dp))
+                    }
+                    Spacer(Modifier.width(10.dp))
                     Box(
-                        modifier = Modifier.size(64.dp).onGloballyPositioned { doneCenter = it.positionInRoot() + Offset(it.size.width / 2f, it.size.height / 2f) }.clip(RoundedCornerShape(22.dp)).background(primary)
+                        modifier = Modifier.size(doneW, doneH).onGloballyPositioned { doneCenter = it.positionInRoot() + Offset(it.size.width / 2f, it.size.height / 2f) }.clip(CircleShape).background(primary)
                             .clickable(enabled = !finishing) {
                                 finishing = true
                                 triggerHaptic(context, HapticStyle.CONFIRM)
@@ -1813,9 +1925,10 @@ fun FocusScreen(
                             },
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Default.Check, contentDescription = "Done", tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(28.dp))
+                        Icon(Icons.Default.Check, contentDescription = "Done", tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(if (landscape) 38.dp else 30.dp))
                     }
-                    Spacer(Modifier.width(20.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Row(Modifier.weight(1f), horizontalArrangement = Arrangement.Start, verticalAlignment = Alignment.CenterVertically) {
                     IconButton(
                         onClick = {
                             triggerHaptic(context, HapticStyle.TICK)
@@ -1832,7 +1945,7 @@ fun FocusScreen(
                     ) {
                         Icon(if (diceMode) Icons.Outlined.Casino else Icons.Outlined.ArrowForward, contentDescription = if (diceMode) "Another one" else "Next task", tint = if (remainingCount > 1) muted else muted.copy(alpha = 0.25f), modifier = Modifier.graphicsLayer { rotationZ = if (diceMode) diceSpin.value else 0f })
                     }
-                    Spacer(Modifier.width(64.dp))
+                    }
                 }
             } else {
                 Row(modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp), horizontalArrangement = Arrangement.Center) {
@@ -1840,6 +1953,33 @@ fun FocusScreen(
                         modifier = Modifier.size(64.dp).clip(RoundedCornerShape(22.dp)).border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(22.dp)).clickable { exit() },
                         contentAlignment = Alignment.Center
                     ) { Icon(Icons.Outlined.ArrowBack, contentDescription = "Back to list", tint = muted) }
+                }
+            }
+        }
+
+        // Entering a new section: a rule with the separator's title (just the rule when it has none) settles in for a moment.
+        var bannerText by remember { mutableStateOf<String?>(null) }
+        val bannerAlpha = remember { Animatable(0f) }
+        LaunchedEffect(sectionBanner, task?.id) {
+            if (sectionBanner == null) return@LaunchedEffect
+            bannerText = sectionBanner
+            delay(500) // after the next task has slid in
+            bannerAlpha.animateTo(1f, tween(450))
+            delay(2200)
+            bannerAlpha.animateTo(0f, tween(600))
+            onBannerDone()
+        }
+        if (bannerAlpha.value > 0.01f && bannerText != null) {
+            Row(
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = doneH + 44.dp, start = 28.dp, end = 28.dp).fillMaxWidth()
+                    .graphicsLayer { alpha = bannerAlpha.value; translationY = (1f - bannerAlpha.value) * 12f },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(Modifier.weight(1f).height(1.dp).background(primary.copy(alpha = 0.6f)))
+                if (bannerText!!.isNotBlank()) {
+                    Text(bannerText!!.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 14.dp).widthIn(max = 260.dp),
+                        style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 2.sp, fontWeight = FontWeight.SemiBold), color = primary)
+                    Box(Modifier.weight(1f).height(1.dp).background(primary.copy(alpha = 0.6f)))
                 }
             }
         }
@@ -1885,6 +2025,62 @@ fun FocusScreen(
     }
 }
 
+data class MedTimer(val taskId: Long, val total: Int, val endsAt: Long, val done: Boolean)
+
+private val MED_WORDS = Regex("meditat|mindful|focus|breath|pranayama|zazen|contemplat|concentrat|stillness|silence|\\bpray|deep work|\\bzen\\b|\\bsit(ting)? quietly", RegexOption.IGNORE_CASE)
+fun wantsMedTimer(t: TaskEntity): Boolean = MED_WORDS.containsMatchIn(t.title) || MED_WORDS.containsMatchIn(t.notes)
+
+private fun clock(sec: Long): String { val s = sec.coerceAtLeast(0); return "%d:%02d".format(s / 60, s % 60) }
+
+/** The same little pill as the website's cooking-mode timer: outlined presets, then a running countdown with +time and a cancel. */
+@Composable
+fun MeditationTimerPill(timer: MedTimer?, defaultMin: Int, onStart: (Int) -> Unit, onAdd: (Int) -> Unit, onClear: () -> Unit) {
+    val context = LocalContext.current
+    val primary = MaterialTheme.colorScheme.primary
+    val onPrimary = MaterialTheme.colorScheme.onPrimary
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val fg = MaterialTheme.colorScheme.onBackground
+    val chipBg = fg.copy(alpha = 0.12f)
+    var now by remember { mutableLongStateOf(android.os.SystemClock.elapsedRealtime()) }
+    LaunchedEffect(timer?.endsAt, timer?.done) { while (timer != null && !timer.done) { now = android.os.SystemClock.elapsedRealtime(); delay(250) } }
+    val label = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold, letterSpacing = 0.2.sp, fontFeatureSettings = "tnum")
+    if (timer == null) {
+        // One capsule: tap to start the default length (set in Settings).
+        Row(
+            modifier = Modifier.height(52.dp).clip(CircleShape).border(1.5.dp, fg.copy(alpha = 0.18f), CircleShape)
+                .clickable { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.TIMER_START); onStart(defaultMin) }.padding(start = 18.dp, end = 24.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = fg, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("$defaultMin min", style = label.copy(fontSize = 17.sp, fontWeight = FontWeight.Medium), color = fg)
+        }
+    } else {
+        val done = timer.done
+        // When it ends the capsule just settles from the accent to quiet white and grey over a couple of seconds. No fill, no flashing.
+        val edge by animateColorAsState(if (done) fg.copy(alpha = 0.18f) else primary, tween(2200), label = "medEdge")
+        val ink by animateColorAsState(if (done) fg else primary, tween(2200), label = "medInk")
+        Row(
+            modifier = Modifier.height(48.dp).clip(CircleShape).border(1.5.dp, edge, CircleShape).padding(start = 20.dp, end = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(if (done) "Done" else clock((timer.endsAt - now + 999) / 1000), style = label.copy(fontSize = 20.sp), color = ink)
+            Spacer(Modifier.width(10.dp))
+            listOf(60 to "+1m", 300 to "+5m").forEach { (sec, chipLabel) ->
+                Box(
+                    Modifier.height(28.dp).clip(CircleShape).background(chipBg)
+                        .clickable { triggerHaptic(context, HapticStyle.TICK); onAdd(sec) }.padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) { Text(chipLabel, style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold), color = muted) }
+                Spacer(Modifier.width(6.dp))
+            }
+            Box(Modifier.size(36.dp).clip(CircleShape).clickable { triggerHaptic(context, HapticStyle.TICK); onClear() }, contentAlignment = Alignment.Center) {
+                Icon(Icons.Outlined.Close, contentDescription = if (done) "Dismiss timer" else "Cancel timer", tint = ink.copy(alpha = 0.7f), modifier = Modifier.size(16.dp))
+            }
+        }
+    }
+}
+
 private fun gaussianStops(c: Color, peak: Float): Array<Pair<Float, Color>> =
     Array(11) { i ->
         val t = i / 10f
@@ -1893,7 +2089,7 @@ private fun gaussianStops(c: Color, peak: Float): Array<Pair<Float, Color>> =
 
 /** Flat page colour of each list. Used by both the live page and the wash, so they are identical. */
 private fun playlistFlat(key: String): Color = when (key) {
-    "morning" -> Color(0xFFF8DE8E)   // soft warm butter, gentler than the accent yellow
+    "morning" -> Color(0xFFFFF0A3)   // sunny pastel yellow
     "night" -> Color(0xFF17134A)     // deep indigo
     "cleaning" -> Color(0xFF0A3B30)  // deep mint-teal
     else -> Color.Black
@@ -2143,18 +2339,24 @@ fun TaskEditorSheet(task: TaskEntity, subtasks: List<SubtaskEntity>, actions: Ed
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val primary = MaterialTheme.colorScheme.primary
     val close = { actions.onEditTask(task, title, notes); onClose() }
+    // Enter saves and closes instead of adding a line. Pasted multi-line text just has its breaks turned into spaces.
+    fun onEdit(old: androidx.compose.ui.text.input.TextFieldValue, new: androidx.compose.ui.text.input.TextFieldValue, set: (androidx.compose.ui.text.input.TextFieldValue) -> Unit) {
+        if (!new.text.contains('\n')) { set(new); return }
+        val flat = new.text.replace("\r", "").replace('\n', ' ')
+        if (new.text.length == old.text.length + 1 && new.text.replace("\n", "") == old.text) close() else set(new.copy(text = flat))
+    }
 
     InWindowSheet(onDismiss = close) {
         Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
             BasicTextField(
-                value = titleV, onValueChange = { titleV = it },
+                value = titleV, onValueChange = { onEdit(titleV, it) { v -> titleV = v } },
                 textStyle = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface),
                 cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) focusedField = 1 },
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences)
             )
             Spacer(Modifier.height(10.dp))
             BasicTextField(
-                value = notesV, onValueChange = { notesV = it },
+                value = notesV, onValueChange = { onEdit(notesV, it) { v -> notesV = v } },
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = muted),
                 cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) focusedField = 2 },
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),

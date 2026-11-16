@@ -101,8 +101,9 @@ private fun playlistFlow(context: Context): Flow<String> = callbackFlow {
 
 @OptIn(ExperimentalCoroutinesApi::class)
 private fun listFlow(context: Context, active: Boolean): Flow<List<TaskEntity>> {
+    // Widgets always show the Main list, whichever list is open in the app.
     val dao = AppDatabase.get(context).taskDao()
-    return playlistFlow(context).flatMapLatest { if (active) dao.getActiveQueue(it) else dao.getTodayList(it) }
+    return if (active) dao.getActiveQueue("main") else dao.getTodayList("main")
 }
 
 suspend fun updateAllWidgets(context: Context) {
@@ -152,14 +153,13 @@ class ListWidget : GlanceAppWidget() {
         provideContent {
             // Collected live, so checking or unchecking in the app (or here) redraws the widget at once.
             val tasks by listFlow(context, active = false).collectAsState(initial)
-            val playlistNow by playlistFlow(context).collectAsState(currentPlaylist(context))
             val shown = tasks
             val tasks_left = shown.count { !it.isSeparator && !it.isCompleted }
             Column(
                 modifier = GlanceModifier.fillMaxSize().background(WBg).cornerRadius(24.dp).padding(horizontal = 16.dp, vertical = 12.dp)
             ) {
                 Row(modifier = GlanceModifier.fillMaxWidth().clickable(openApp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(playlistNow.let { k -> if (k == "main") "MONO" else "MONO · " + (PLAYLISTS.firstOrNull { it.first == k }?.second ?: "") }, style = TextStyle(color = ColorProvider(WAccent), fontSize = 12.sp, fontWeight = FontWeight.Bold))
+                    Text("MONO", style = TextStyle(color = ColorProvider(WAccent), fontSize = 12.sp, fontWeight = FontWeight.Bold))
                     Spacer(GlanceModifier.defaultWeight())
                     if (tasks_left > 0) Text("$tasks_left", style = TextStyle(color = ColorProvider(WMuted), fontSize = 12.sp))
                 }
@@ -172,7 +172,7 @@ class ListWidget : GlanceAppWidget() {
                     LazyColumn(modifier = GlanceModifier.fillMaxSize()) {
                         items(shown, itemId = { it.id }) { t ->
                             if (t.isSeparator) {
-                                Row(modifier = GlanceModifier.fillMaxWidth().padding(top = 8.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Row(modifier = GlanceModifier.fillMaxWidth().padding(top = 12.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                                     if (t.title.isNotBlank()) { Text(t.title.uppercase(), maxLines = 1, style = TextStyle(color = ColorProvider(WMuted), fontSize = 10.sp, fontWeight = FontWeight.Medium)); Spacer(GlanceModifier.width(8.dp)) }
                                     Box(modifier = GlanceModifier.defaultWeight().height(1.dp).background(WMuted.copy(alpha = 0.35f))) {}
                                 }
