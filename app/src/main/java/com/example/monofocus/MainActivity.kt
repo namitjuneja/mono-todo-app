@@ -117,6 +117,8 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -172,6 +174,9 @@ interface TaskDao {
     @Query("DELETE FROM tasks WHERE playlist = :playlist AND isSeparator = 1 AND archivedFromList = 0")
     suspend fun deleteSeparators(playlist: String)
 
+    @Query("UPDATE tasks SET archivedFromList = 0, archivedAt = 0 WHERE id IN (:ids)")
+    suspend fun unarchive(ids: List<Long>)
+
     @Query("UPDATE tasks SET archivedFromList = 1, archivedAt = :now WHERE id = :id")
     suspend fun archiveOne(id: Long, now: Long)
 
@@ -202,6 +207,13 @@ interface TaskDao {
         val at = index.coerceIn(0, ids.size)
         ids.forEachIndexed { i, id -> updateOrder(id, (if (i < at) i + 1 else i + 2) * 10L) }
         return insert(task.copy(queueOrder = (at + 1) * 10L))
+    }
+
+    /** Inserts [tasks] in order at [at]. With [orders] they take those positions; without, the whole list is renumbered around them. */
+    @Transaction
+    suspend fun insertMany(ids: List<Long>, at: Int, tasks: List<TaskEntity>, orders: List<Long>?): List<Long> {
+        if (orders == null) ids.forEachIndexed { i, id -> updateOrder(id, (if (i < at) i + 1 else i + tasks.size + 1) * 10L) }
+        return tasks.mapIndexed { k, t -> insert(t.copy(queueOrder = orders?.get(k) ?: ((at + 1 + k) * 10L))) }
     }
 
     @Transaction
@@ -374,7 +386,19 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         viewModelScope.launch { dao.addFocusSession(taskId) }
     }
 
-    fun archiveTask(task: TaskEntity) { viewModelScope.launch { dao.archiveOne(task.id, System.currentTimeMillis()) } }
+    /** A short-lived "Undo" offer shown after archiving; [undo] puts everything back exactly as it was. */
+    data class UndoBanner(val id: Long, val label: String, val undo: suspend () -> Unit)
+    var undoBanner by androidx.compose.runtime.mutableStateOf<UndoBanner?>(null)
+    private var undoSeq = 0L
+    fun dismissUndo() { undoBanner = null }
+    fun runUndo() { val b = undoBanner ?: return; undoBanner = null; viewModelScope.launch { b.undo() } }
+
+    fun archiveTask(task: TaskEntity) {
+        viewModelScope.launch {
+            dao.archiveOne(task.id, System.currentTimeMillis())
+            undoBanner = UndoBanner(++undoSeq, "Task archived") { dao.unarchive(listOf(task.id)) }
+        }
+    }
 
     fun deleteSeparator(task: TaskEntity) { viewModelScope.launch { dao.delete(task) } }
     fun setSeparatorLabel(task: TaskEntity, label: String) { viewModelScope.launch { dao.setLabel(task.id, label.trim()) } }
@@ -386,9 +410,17 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
     }
 
     fun archiveAll() {
+        val before = todayList.value
+        val tasks = before.filter { !it.isSeparator }
+        if (tasks.isEmpty()) return
+        val seps = before.filter { it.isSeparator }
         viewModelScope.launch {
             dao.archiveCompleted(_playlist.value, System.currentTimeMillis())
             dao.deleteSeparators(_playlist.value)   // archiving everything clears the separators too
+            undoBanner = UndoBanner(++undoSeq, if (tasks.size == 1) "1 task archived" else "${tasks.size} tasks archived") {
+                dao.unarchive(tasks.map { it.id })
+                if (seps.isNotEmpty()) dao.insertAll(seps)   // separators come back with their old ids and places
+            }
         }
     }
 
@@ -424,63 +456,47 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         }
     }
 
-    /** A new task slotted in right after [afterId] (a task or a separator), keeping everything else in place. */
-    fun insertAfter(afterId: Long, title: String) {
-        val t = title.trim()
-        if (t.isEmpty()) return
-        viewModelScope.launch {
-            val at = todayList.value.indexOfFirst { it.id == afterId }
-            insertTaskAt(if (afterId == TOP_SEAM) 0 else if (at >= 0) at + 1 else todayList.value.size, t)
-        }
+    /** The rows that were just slotted in by hand, in order; each fades in (one after another) where it belongs. */
+    var freshIds by androidx.compose.runtime.mutableStateOf<List<Long>>(emptyList())
+    private val insertMutex = kotlinx.coroutines.sync.Mutex()
+
+    /** One or more lines typed in the bar, slotted in right after [afterId] (TOP_SEAM = the very top). [onPlaced] gets the id of the last new row. */
+    fun insertAt(afterId: Long, raw: String, onPlaced: (Long) -> Unit) {
+        val lines = parseTaskLines(raw)
+        if (lines.isEmpty()) return
+        val now = System.currentTimeMillis()
+        insertBlock(afterId, lines.map { (line, done) ->
+            TaskEntity(title = line, playlist = _playlist.value, isCompleted = done, completedAt = if (done) now else null)
+        }, onPlaced)
     }
 
-    /** The task that was just slotted in by hand; its row fades in where it belongs. */
-    var freshTaskId by androidx.compose.runtime.mutableStateOf<Long?>(null)
-
-    /** Writes a new task straight into position [index] of the list (one write, so it never flashes at the bottom first). */
-    private suspend fun insertTaskAt(index: Int, title: String) {
-        val list = todayList.value
-        val lo = list.getOrNull(index - 1)?.queueOrder
-        val hi = list.getOrNull(index)?.queueOrder
-        if (lo != null && hi != null && hi - lo > 1) {
-            freshTaskId = dao.insert(TaskEntity(title = title, queueOrder = lo + (hi - lo) / 2, playlist = _playlist.value))
-        } else if (lo == null && hi != null) {
-            freshTaskId = dao.insert(TaskEntity(title = title, queueOrder = hi - 10L, playlist = _playlist.value))
-        } else {
-            // No whole number left between the neighbours: renumber and insert in one go.
-            freshTaskId = dao.insertAtIndex(list.map { it.id }, index, TaskEntity(title = title, playlist = _playlist.value))
-        }
+    /** A separator (the typed text is its label) slotted in right after [afterId]. */
+    fun insertSeparatorAt(afterId: Long, label: String, onPlaced: (Long) -> Unit) {
+        insertBlock(afterId, listOf(TaskEntity(title = label.trim(), playlist = _playlist.value, isSeparator = true)), onPlaced)
     }
 
-    /** A new task slotted in right before [beforeId]. */
-    fun insertBefore(beforeId: Long, title: String) {
-        val t = title.trim()
-        if (t.isEmpty()) return
+    /** Writes [entities] in order into the spot right after [afterId], in one transaction so the list changes once (nothing flashes at the bottom first). */
+    private fun insertBlock(afterId: Long, entities: List<TaskEntity>, onPlaced: (Long) -> Unit) {
         viewModelScope.launch {
-            val at = todayList.value.indexOfFirst { it.id == beforeId }
-            insertTaskAt(if (at >= 0) at else todayList.value.size, t)
-        }
-    }
-
-    /** The separator that was just created by a hold gesture; its row fades in instead of simply appearing. */
-    var freshSepId by androidx.compose.runtime.mutableStateOf<Long?>(null)
-
-    /** An empty separator slotted in right after [afterId], written once so it never flashes at the bottom first. */
-    fun insertSeparatorAfter(afterId: Long) {
-        viewModelScope.launch {
-            val list = todayList.value
-            val at = list.indexOfFirst { it.id == afterId }
-            val lo = list.getOrNull(at)?.queueOrder
-            val hi = list.getOrNull(at + 1)?.queueOrder
-            if (afterId == TOP_SEAM && hi != null) {
-                // The empty space above the first to-do: the separator goes to the very top.
-                freshSepId = dao.insert(TaskEntity(title = "", queueOrder = hi - 10L, playlist = _playlist.value, isSeparator = true))
-            } else if (lo != null && hi != null && hi - lo > 1) {
-                val id = dao.insert(TaskEntity(title = "", queueOrder = lo + (hi - lo) / 2, playlist = _playlist.value, isSeparator = true))
-                freshSepId = id
-            } else {
-                freshSepId = dao.insertAtIndex(list.map { it.id }, if (at >= 0) at + 1 else list.size, TaskEntity(title = "", playlist = _playlist.value, isSeparator = true))
+            val ids = insertMutex.withLock {
+                val list = todayList.value
+                val at = if (afterId == TOP_SEAM) 0 else list.indexOfFirst { it.id == afterId }.let { if (it >= 0) it + 1 else list.size }
+                val n = entities.size
+                val lo = list.getOrNull(at - 1)?.queueOrder
+                val hi = list.getOrNull(at)?.queueOrder
+                val orders: List<Long>? = when {
+                    lo != null && hi != null -> if (hi - lo > n) List(n) { k -> lo + (hi - lo) * (k + 1) / (n + 1) } else null   // no whole numbers left: renumber
+                    hi != null -> List(n) { k -> hi - 10L * (n - k) }
+                    lo != null -> List(n) { k -> lo + 10L * (k + 1) }
+                    else -> { val base = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L; List(n) { k -> base + 10L * k } }
+                }
+                dao.insertMany(list.map { it.id }, at, entities, orders).also { freshIds = it }
             }
+            // Hand the new spot back once the rows are really in the list, so a quick next add lands after them.
+            kotlinx.coroutines.withTimeoutOrNull(800) { todayList.first { l -> l.any { it.id == ids.last() } } }
+            onPlaced(ids.last())
+            delay(1500)
+            if (freshIds === ids) freshIds = emptyList()
         }
     }
 
@@ -1020,8 +1036,8 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     autoSelectId = autoSelectId,
                     onOpenSettings = { c -> returnId = null; openSettings(c) },
                     keepScreenOn = keepScreenOn, onToggleKeepScreenOn = { toggleKeepAwake() },
-                    onArchiveAll = viewModel::archiveAll,
-                    onInsertAfter = viewModel::insertAfter, onInsertBefore = viewModel::insertBefore, onInsertSeparatorAfter = viewModel::insertSeparatorAfter, freshSepId = viewModel.freshSepId, freshTaskId = viewModel.freshTaskId, onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
+                    onArchiveAll = viewModel::archiveAll, undoBanner = viewModel.undoBanner, onUndo = viewModel::runUndo, onDismissUndo = viewModel::dismissUndo,
+                    onInsertAt = viewModel::insertAt, onInsertSeparatorAt = viewModel::insertSeparatorAt, freshIds = viewModel.freshIds, onAddSeparator = viewModel::addSeparator, onDeleteSeparator = viewModel::deleteSeparator, onLabelSeparator = viewModel::setSeparatorLabel,
                     playlist = playlist, onPlaylist = { k, c -> switchPlaylist(k, c) },
                     onRoll = { rollDice(null) },
                     onCleaningToggle = { c -> switchPlaylist(if (playlist == "cleaning") "main" else "cleaning", c) },
@@ -1183,7 +1199,8 @@ fun HomeScreen(
     tasks: List<TaskEntity>, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions,
     onAddTasks: (String) -> Unit, onComplete: (TaskEntity) -> Unit, onUndoComplete: (TaskEntity) -> Unit,
     onReorder: (List<TaskEntity>) -> Unit, onSelect: (TaskEntity, Float) -> Unit, onOpenSettings: (Offset) -> Unit, onArchiveAll: () -> Unit, onArchiveTask: (TaskEntity) -> Unit,
-    onInsertAfter: (Long, String) -> Unit, onInsertBefore: (Long, String) -> Unit, onInsertSeparatorAfter: (Long) -> Unit, freshSepId: Long?, freshTaskId: Long?, onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
+    onInsertAt: (Long, String, (Long) -> Unit) -> Unit, onInsertSeparatorAt: (Long, String, (Long) -> Unit) -> Unit, freshIds: List<Long>, onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
+    undoBanner: TaskViewModel.UndoBanner? = null, onUndo: () -> Unit = {}, onDismissUndo: () -> Unit = {},
     playlist: String, onPlaylist: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit,
     autoSelectId: Long?, returnId: Long?, returnY: Float, onReturnConsumed: () -> Unit,
     keepScreenOn: Boolean = false, onToggleKeepScreenOn: () -> Unit = {}
@@ -1211,7 +1228,6 @@ fun HomeScreen(
     LaunchedEffect(Unit) { if (returnId != null) { selectingId = null; onReturnConsumed() } }
     val chromeAlpha by animateFloatAsState(if (selectingId != null) 0f else 1f, tween(440, easing = FastOutSlowInEasing), label = "chrome")
     var editingId by remember { mutableStateOf<Long?>(null) }
-    var confirmArchiveAll by remember { mutableStateOf(false) }
     var editingSeparator by remember { mutableStateOf<TaskEntity?>(null) }
 
     // Local copy of the list so drag-to-reorder is instant; written back on drop.
@@ -1255,166 +1271,56 @@ fun HomeScreen(
         if (i >= 0 && readyId != autoSelectId) { centerRow(i, autoSelectId); readyId = autoSelectId }
     }
 
-    // Hold on the line between two tasks: a gap opens, then a blank row with the keyboard (or a separator if you keep holding).
-    var gapAfterId by remember { mutableStateOf<Long?>(null) }
-    // Where the open "new to-do" row is, so a press anywhere else can close the keyboard and finish it.
-    var newRowBounds by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
-    var boxOrigin by remember { mutableStateOf(Offset.Zero) }
+    // Tap the empty space above or below any to-do or separator to choose where the next things you add go.
+    // TOP_SEAM = above the first row; otherwise "right after the row with this id". It lets go by itself after a while without use.
+    var slotId by remember { mutableStateOf<Long?>(null) }
+    var slotTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(slotId, slotTick) { if (slotId != null) { delay(12_000); slotId = null } }
+    LaunchedEffect(input) { if (slotId != null) slotTick++ }   // typing keeps the spot alive
+    LaunchedEffect(playlist, selectingId) { slotId = null }
+    LaunchedEffect(items.size) { delay(400); val s = slotId; if (s != null && s != TOP_SEAM && items.none { it.id == s }) slotId = null }
+    // Once what was typed is in, the chosen spot lets go and the keyboard tucks away.
     val keyboardCtl = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
-    var gapBefore by remember { mutableStateOf(false) }
-    // While a finger is still holding, the new row is only shown; focus, keyboard and scrolling wait for the release.
-    var gapActive by remember { mutableStateOf(true) }
-    var committedFrom by remember { mutableStateOf<Long?>(-1L) }   // -1 = nothing committed; otherwise the fresh-task id before the commit
-    // The ids present at the moment of commit: the typed task is whichever new to-do shows up after that (no waiting for freshTaskId, which is set a moment apart from the list update).
-    var committedIds by remember { mutableStateOf<Set<Long>?>(null) }
-    val rowTakenOver = committedFrom != -1L && committedIds != null && items.any { !it.isSeparator && it.id !in committedIds!! }
-    LaunchedEffect(rowTakenOver) { if (rowTakenOver) { gapAfterId = null; gapBefore = false; committedFrom = -1L; committedIds = null } }   // the new row sits above its separator (the separator was dragged below it)
-    val newRowPx = remember(density) { with(density) { 54.dp.toPx() } }
-    var spreadAfterId by remember { mutableStateOf<Long?>(null) }
-    var spreadAmount by remember { mutableFloatStateOf(0f) }
-    var multiTouch by remember { mutableStateOf(false) }
-    var touching by remember { mutableStateOf(false) }
-
-    // When the blank row opens, lift the list so it sits above the keyboard (after the keyboard has finished rising).
-    LaunchedEffect(gapAfterId, gapActive) {
-        val id = gapAfterId ?: return@LaunchedEffect
-        if (!gapActive) return@LaunchedEffect
-        // Wait for the keyboard to finish rising (and the list's bottom room to grow with it), then lift the row.
-        var prev = -1
-        for (k in 0 until 25) { val b = imeInsets.getBottom(density); if (b > 0 && b == prev) break; prev = b; delay(60) }
-        delay(120)
-        // A finger still on the screen outranks a programmatic scroll, so wait for it to lift.
-        while (touching) delay(30)
-        val i = items.indexOfFirst { it.id == id }
-        if (i >= 0) centerRow(i, id, force = true)
-    }
-    // The gap that made room for a new separator closes the moment that separator's row exists (it fades in over the same space).
-    // These are read from long-lived gesture/row lambdas, so they must always see the latest value, not the one from when the lambda was created.
-    val freshSepNow by rememberUpdatedState(freshSepId)
-    val freshTaskNow by rememberUpdatedState(freshTaskId)
-    val freshHere = freshSepId != null && items.any { it.id == freshSepId }
-    LaunchedEffect(freshHere) { if (freshHere) { spreadAfterId = null; spreadAmount = 0f } }
-    // Safety: if the separator never shows up, don't leave the gap open.
-    LaunchedEffect(spreadAfterId, multiTouch) { if (spreadAfterId != null && !multiTouch) { delay(1500); if (!multiTouch) { spreadAfterId = null; spreadAmount = 0f } } }
-    // Holding long enough turns the open new-to-do into a separator: the to-do fades while the rows slide, then the separator fades in.
-    var convertAfterId by remember { mutableStateOf<Long?>(null) }
-    var convertFromSep by remember { mutableStateOf<Long?>(null) }
-    val convertP = remember { Animatable(0f) }
-    val sepTakenOver = convertAfterId != null && freshSepId != null && freshSepId != convertFromSep && items.any { it.id == freshSepId }
-    // The moment the separator exists, all three things start together: the to-do ghost fades out, the rows below slide up, and the separator fades in.
-    LaunchedEffect(sepTakenOver) {
-        if (sepTakenOver) {
-            convertP.snapTo(0f)
-            convertP.animateTo(1f, tween(450, easing = FastOutSlowInEasing))
-            convertAfterId = null
-            convertP.snapTo(0f)
-        }
-    }
-    fun convertToSeparator(seam: Long) {
-        scope.launch {
-            keyboardCtl?.hide(); focusManager.clearFocus()
-            convertFromSep = freshSepNow
-            convertP.snapTo(0f)
-            convertAfterId = seam; gapAfterId = null; gapBefore = false
-            onInsertSeparatorAfter(seam)
-        }
-    }
-    val spreadNeeded = remember(density) { with(density) { 52.dp.toPx() } }
-    val spreadTol = remember(density) { with(density) { 12.dp.toPx() } }
-    // One finger: press and hold on the seam between two tasks. Let go after a moment for a new to-do, keep holding for a separator.
-    val spreadGesture = Modifier.pointerInput(Unit) {
+    fun finishPlacing() { slotId = null; keyboardCtl?.hide(); focusManager.clearFocus() }
+    val seamTol = remember(density) { with(density) { 12.dp.toPx() } }
+    val gapHalf = remember(density) { with(density) { 7.dp.toPx() } }
+    fun it_seam(i: androidx.compose.foundation.lazy.LazyListItemInfo, marked: Long?, half: Float): Float = i.offset + i.size - (if (i.key == marked) half else 0f)
+    val slotGesture = Modifier.pointerInput(Unit) {
         awaitEachGesture {
             val first = awaitFirstDown(requireUnconsumed = false, pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial)
-            touching = true
-            // A press anywhere else while the new-to-do row is open just closes the keyboard (the row then keeps its text or drops itself if empty); it does nothing else.
-            var dismissedByPress = false
-            if (gapAfterId != null) {
-                val b = newRowBounds
-                if (b == null || !b.contains(first.position + boxOrigin)) { focusManager.clearFocus(); keyboardCtl?.hide(); first.consume(); dismissedByPress = true }
-            }
-            var sepHoldKey: Long? = null
-            val seam: Long? = if (selectingId == null && draggingId == null && gapAfterId == null)
-                listState.layoutInfo.visibleItemsInfo.let { vis ->
-                    // Item offsets are measured from the start of the list content, i.e. after its top padding.
-                    val y = first.position.y - listState.layoutInfo.beforeContentPadding
-                    val sepIds = items.filter { it.isSeparator }.map { it.id }.toSet()
-                    // A press anywhere on a separator belongs to the separator: hold to drag it, keep holding to open a new to-do beside it.
-                    val sepMiddle = vis.any { it.key in sepIds && y >= it.offset && y <= it.offset + it.size }
-                    val slot = vis.firstOrNull { it.key == "top-slot" }
-                    if (slot != null && slot.size > 0 && y <= slot.offset + slot.size && !sepMiddle) TOP_SEAM
-                    else if (sepMiddle) { sepHoldKey = vis.firstOrNull { it.key in sepIds && y > it.offset && y < it.offset + it.size }?.key as? Long; null }
-                    else {
-                        val last = vis.lastOrNull()
-                        val belowLast = if (last != null && last.key == items.lastOrNull()?.id && y > last.offset + last.size - spreadTol) last.key else null
-                        belowLast ?: vis.map { (it.offset + it.size) to it.key }
-                            .filter { kotlin.math.abs(it.first - y) <= spreadTol }
-                            .minByOrNull { kotlin.math.abs(it.first - y) }?.second
-                    }
-                } as? Long else null
-            var stillDown = true
-            var eatUp = false     // after a hold on a separator, lifting the finger must not also open its editor
-            if (seam == null && sepHoldKey != null) {
-                // Holding on a separator itself: it lifts so you can drag it; keep holding still for a bit longer and a new to-do opens just below it. Keep holding and you can still drag the separator (see onDragRow).
-                val held = withTimeoutOrNull(1000L) {
-                    var ok = true
-                    while (ok) {
-                        val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
-                        stillDown = e.changes.any { it.pressed }
-                        val c = e.changes.firstOrNull { it.id == first.id }
-                        if (c == null || !c.pressed || (c.position - first.position).getDistance() > viewConfiguration.touchSlop) ok = false
-                    }
-                    true
-                }
-                if (held == null && stillDown) { triggerHaptic(context, HapticStyle.CONFIRM); gapBefore = false; gapActive = false; gapAfterId = sepHoldKey; eatUp = true }
-            }
-            var eatRest = dismissedByPress   // the lift after a long hold must not also count as a tap on the row
-            if (seam != null) {
-                // Hold still for a moment: anything quicker is an ordinary tap or scroll and is left alone.
-                val cancelled = withTimeoutOrNull(340L) {
-                    var ok = true
-                    while (ok) {
-                        val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
-                        stillDown = e.changes.any { it.pressed }
-                        val c = e.changes.firstOrNull { it.id == first.id }
-                        if (c == null || !c.pressed || (c.position - first.position).getDistance() > viewConfiguration.touchSlop) ok = false
-                    }
-                    true
-                }
-                if (cancelled == null && stillDown) {
-                    // Held on the seam: the line opens up, then a new to-do opens right there (finger still down).
-                    // Keep holding and that to-do fades away while the rows slide, and a separator takes its place.
-                    triggerHaptic(context, HapticStyle.TICK)
-                    multiTouch = true; spreadAfterId = seam; spreadAmount = 0f
-                    val t0 = android.os.SystemClock.uptimeMillis()
-                    var opened = false
-                    var toSeparator = false
-                    while (true) {
-                        val elapsed = android.os.SystemClock.uptimeMillis() - t0
-                        if (!opened && elapsed >= 260L) {
-                            opened = true
-                            triggerHaptic(context, HapticStyle.CONFIRM)
-                            spreadAfterId = null; spreadAmount = 0f
-                            gapBefore = false; gapActive = false; gapAfterId = seam
-                            eatUp = true   // lifting the finger must not also tap whatever is underneath
-                        }
-                        if (opened && elapsed >= 1500L) { toSeparator = true; break }
-                        if (!opened) spreadAmount = (elapsed / 260f).coerceIn(0f, 1f)
-                        val e = withTimeoutOrNull(40L) { awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial) }
-                        if (e != null) {
-                            e.changes.forEach { it.consume() }
-                            stillDown = e.changes.any { it.pressed }
-                            val c = e.changes.firstOrNull { it.id == first.id }
-                            if (c == null || (c.position - first.position).getDistance() > viewConfiguration.touchSlop * 3 || !stillDown)  break
-                        }
-                    }
-                    multiTouch = false
-                    if (!opened) { spreadAfterId = null; spreadAmount = 0f }
-                    if (toSeparator) { triggerHaptic(context, HapticStyle.CONFIRM); eatRest = true; convertToSeparator(seam) }
+            if (selectingId != null || draggingId != null || items.isEmpty()) return@awaitEachGesture
+            val vis = listState.layoutInfo.visibleItemsInfo.filter { it.key != "top-slot" }
+            val firstVis = vis.firstOrNull() ?: return@awaitEachGesture
+            val lastVis = vis.last()
+            // Item offsets are measured from the start of the list content, i.e. after its top padding.
+            val y = first.position.y - listState.layoutInfo.beforeContentPadding
+            val onRow = vis.any { y >= it.offset && y <= it.offset + it.size }
+            val seam: Long? = when {
+                firstVis.key == items.first().id && y <= firstVis.offset + seamTol -> TOP_SEAM
+                lastVis.key == items.last().id && y >= lastVis.offset + lastVis.size - seamTol -> items.last().id
+                else -> {
+                    // Where each seam really is: the marked one sits in the middle of its open gap, so the line itself is a tap target.
+                    fun seamY(i: androidx.compose.foundation.lazy.LazyListItemInfo) = it_seam(i, slotId, gapHalf)
+                    vis.minByOrNull { kotlin.math.abs(seamY(it) - y) }?.takeIf { kotlin.math.abs(seamY(it) - y) <= seamTol }?.key as? Long
                 }
             }
-            while (stillDown) { val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial); if (eatRest) e.changes.forEach { it.consume() } else if (eatUp) e.changes.forEach { if (!it.pressed) it.consume() }; stillDown = e.changes.any { it.pressed } }
-            gapActive = true   // finger lifted: now the new row takes focus, the keyboard rises and the list scrolls to it
-            touching = false
+            if (seam == null) return@awaitEachGesture
+            // Only a quick tap counts; a scroll, drag or hold is left alone.
+            var up: androidx.compose.ui.input.pointer.PointerInputChange? = null
+            withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                while (true) {
+                    val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                    val c = e.changes.firstOrNull { it.id == first.id } ?: break
+                    if (c.isConsumed) break
+                    if (!c.pressed) { up = c; break }
+                    if ((c.position - first.position).getDistance() > viewConfiguration.touchSlop) break
+                }
+            }
+            val lift = up ?: return@awaitEachGesture
+            if (onRow) lift.consume()   // the edge of a row is not a tap on that row
+            triggerHaptic(context, HapticStyle.TICK)
+            // Tapping the marked spot again lets it go.
+            if (slotId == seam) slotId = null else { slotId = seam; slotTick++ }
         }
     }
 
@@ -1458,6 +1364,7 @@ fun HomeScreen(
     // Double-tapping empty space opens the first open task through the same grow-into-focus animation as tapping it.
     fun startFirst() {
         if (selectingId != null || draggingId != null) return
+        slotId = null
         val i = items.indexOfFirst { !it.isSeparator && !it.isCompleted }
         if (i < 0) return
         val id = items[i].id
@@ -1474,8 +1381,10 @@ fun HomeScreen(
         if (input.isNotBlank()) {
             triggerHaptic(context, HapticStyle.TICK)
             Sfx.play(Sound.ADD)
-            onAddTasks(input)
+            val s = slotId
+            if (s != null) onInsertAt(s, input) {} else onAddTasks(input)
             input = ""
+            if (s != null) finishPlacing()
         }
     }
 
@@ -1506,7 +1415,7 @@ fun HomeScreen(
                 if (keepScreenOn) IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); onToggleKeepScreenOn() }, modifier = Modifier.size(38.dp)) {
                     Icon(Icons.Outlined.Visibility, contentDescription = "Eye is on. Tap to turn it off", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(19.dp))
                 }
-                IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); confirmArchiveAll = true }, enabled = items.any { !it.isSeparator } && selectingId == null, modifier = Modifier.size(38.dp)) {
+                IconButton(onClick = { triggerHaptic(context, HapticStyle.CONFIRM); Sfx.play(Sound.SWEEP); onArchiveAll() }, enabled = items.any { !it.isSeparator } && selectingId == null, modifier = Modifier.size(38.dp)) {
                     Icon(Icons.Outlined.MoveToInbox, contentDescription = "Archive all", tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (items.isNotEmpty()) 0.6f else 0.25f), modifier = Modifier.size(19.dp))
                 }
             }
@@ -1514,7 +1423,7 @@ fun HomeScreen(
 
         // The list runs underneath the dock, so the empty corners beside the list-button tab show the text and take double-taps too.
         Box(modifier = Modifier.weight(1f).fillMaxWidth().pointerInput(Unit) { detectTapGestures(onDoubleTap = { startFirst() }) }) {
-        Box(modifier = Modifier.fillMaxSize().onGloballyPositioned { boxOrigin = it.positionInRoot() }.nestedScroll(pullConnection).then(spreadGesture)) {
+        Box(modifier = Modifier.fillMaxSize().nestedScroll(pullConnection).then(slotGesture)) {
             // The gear that rises out of the top edge while you pull.
             val reveal = (pull / pullThreshold).coerceIn(0f, 1f)
             if (reveal > 0.02f) Box(
@@ -1538,48 +1447,30 @@ fun HomeScreen(
                 Text(if (playlist == "cleaning") "Add tiny 2-minute cleans here." else "Nothing to do.", modifier = Modifier.align(Alignment.Center), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { translationY = pull }, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp + heldPad.value)) {
-                // Decided here, in the same pass that builds the list, so the typing row and the real row can never be on screen together for a frame.
-                val takenNow = committedFrom != -1L && committedIds != null && items.any { !it.isSeparator && it.id !in committedIds!! }
                 item(key = "top-slot") {
                     val first = items.firstOrNull()
-                    val convertingTop = convertAfterId == TOP_SEAM
-                    val slotH = if (convertingTop && sepTakenOver) 24f * (1f - convertP.value) else if (first != null && !first.isSeparator) 24f else 0f
                     Column(Modifier.fillMaxWidth()) {
-                        Spacer(Modifier.fillMaxWidth().height(animateDpAsState(slotH.dp, tween(200), label = "slotH").value))
-                        if (spreadAfterId == TOP_SEAM) Box(Modifier.fillMaxWidth().height(2.dp + 49.dp * spreadAmount)) { Box(Modifier.fillMaxWidth().height(1.5.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))) }
-                        if (gapAfterId == TOP_SEAM && !takenNow) NewTaskRow(onCommit = { committedFrom = freshTaskNow; committedIds = items.map { it.id }.toSet(); onInsertAfter(TOP_SEAM, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
-                        if (convertingTop) ConvertGap(convertP.value, sepTakenOver)
+                        Spacer(Modifier.fillMaxWidth().height(animateDpAsState(if (first != null && !first.isSeparator) 24.dp else 0.dp, tween(200), label = "slotH").value))
+                        SlotLine(slotId == TOP_SEAM)
                     }
                 }
                 items(items, key = { it.id }) { task ->
-                    // Once a typed-in task exists in the list, its real row takes the place of the typing row in the same frame (no gap, no sliding).
-                    val takenOver = takenNow
                     val isDragging = draggingId == task.id
                     val rowModifier = if (isDragging || selectingId == task.id) Modifier.zIndex(1f) else Modifier.animateItemPlacement()
                     val dragTranslation = {
                         val info = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == task.id }
-                        val base = if (info == null) dragDelta else dragDelta - (info.offset - dragStartOffset)
-                        // Once the new row has hopped above the separator, the separator's own slot is one row lower.
-                        if (gapAfterId == task.id && gapBefore) base - newRowPx else base
+                        if (info == null) dragDelta else dragDelta - (info.offset - dragStartOffset)
                     }
-                    // While two fingers are down (the pull-apart gesture) nothing may pick a row up.
+                    val freshIdx = freshIds.indexOf(task.id)
                     val onDragStartRow = {
-                        if (!multiTouch) {
-                            triggerHaptic(context, HapticStyle.TICK)
-                            if (gapAfterId != task.id) focusManager.clearFocus()
-                            draggingId = task.id
-                            dragDelta = 0f
-                            dragStartOffset = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == task.id }?.offset ?: 0
-                        }
+                        triggerHaptic(context, HapticStyle.TICK)
+                        focusManager.clearFocus()
+                        draggingId = task.id
+                        dragDelta = 0f
+                        dragStartOffset = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == task.id }?.offset ?: 0
                     }
                     val onDragRow = { dy: Float ->
-                      if (draggingId == task.id && gapAfterId == task.id) {
-                        // A new to-do is open under this separator: the separator can only slide past it, not wander off.
-                        dragDelta = (dragDelta + dy).coerceIn(0f, newRowPx)
-                        // The moment the separator passes the new row's middle, the new to-do hops above it (and back if you drag up again).
-                        val passed = dragDelta > newRowPx / 2f
-                        if (passed != gapBefore) { gapBefore = passed; triggerHaptic(context, HapticStyle.TICK) }
-                      } else if (draggingId == task.id) {
+                      if (draggingId == task.id) {
                         dragDelta += dy
                         val info = listState.layoutInfo
                         val me = info.visibleItemsInfo.firstOrNull { it.key == task.id }
@@ -1606,51 +1497,20 @@ fun HomeScreen(
                       }
                     }
                     val onDragEndRow = {
-                        if (draggingId == task.id && gapAfterId == task.id) {
-                            gapBefore = dragDelta > newRowPx / 2f
-                            draggingId = null
-                            dragDelta = 0f
-                        } else if (draggingId == task.id) {
+                        if (draggingId == task.id) {
                             draggingId = null
                             dragDelta = 0f
                             onReorder(items.toList())
                         }
                     }
                     if (task.isSeparator) {
-                        // One new-to-do row that can sit above or below its separator (the separator can be dragged past it) without losing what was typed or its focus.
-                        val newRow = remember(task.id) { movableContentOf {
-                            // When the separator is dragged past it, the row glides to its new side instead of jumping.
-                            val glide = remember { Animatable(0f) }
-                            val sepPx = with(density) { 34.dp.toPx() }
-                            var lastBefore by remember { mutableStateOf(gapBefore) }
-                            LaunchedEffect(gapBefore) {
-                                if (gapBefore != lastBefore) {
-                                    lastBefore = gapBefore
-                                    glide.snapTo(if (gapBefore) sepPx else -sepPx)
-                                    glide.animateTo(0f, tween(220, easing = FastOutSlowInEasing))
-                                }
-                            }
-                            Box(Modifier.graphicsLayer { translationY = glide.value }) {
-                            NewTaskRow(
-                                onCommit = { committedFrom = freshTaskNow; committedIds = items.map { it.id }.toSet(); if (gapBefore) onInsertBefore(task.id, it) else onInsertAfter(task.id, it) },
-                                onCancel = { gapAfterId = null; gapBefore = false },
-                                active = gapActive,
-                                refocus = gapBefore,
-                                onPlaced = { newRowBounds = it }
-                            )
-                            }
-                        } }
-                        if (gapAfterId == task.id && gapBefore && !takenOver) newRow()
                         SeparatorRow(
-                            task = task, fresh = freshSepId == task.id, isDragging = isDragging, modifier = rowModifier, hidden = selectingId != null,
+                            task = task, fresh = freshIdx >= 0, freshDelay = freshIdx * 70, isDragging = isDragging, modifier = rowModifier, hidden = selectingId != null,
                             dragTranslation = dragTranslation, onEdit = { editingSeparator = task }, onDelete = { onDeleteSeparator(task) },
                             onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
                         )
-                        if (spreadAfterId == task.id) Box(Modifier.fillMaxWidth().height(2.dp + 49.dp * spreadAmount)) { Box(Modifier.fillMaxWidth().height(1.5.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))) }
-                        if (gapAfterId == task.id && !gapBefore && !takenOver) newRow()
-                        if (convertAfterId == task.id) ConvertGap(convertP.value, sepTakenOver)
                     } else TaskRow(
-                        task = task,
+                        task = task, fresh = freshIdx >= 0, freshDelay = freshIdx * 70,
                         subtasks = subtasksByTask[task.id].orEmpty(),
                         onOpen = { if (selectingId == null) { triggerHaptic(context, HapticStyle.TICK); editingId = task.id } },
                         isDragging = isDragging,
@@ -1675,10 +1535,29 @@ fun HomeScreen(
                         onToggleSub = editor.onToggleSub,
                         onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
                     )
-                    if (spreadAfterId == task.id) Box(Modifier.fillMaxWidth().height(2.dp + 49.dp * spreadAmount)) { Box(Modifier.fillMaxWidth().height(1.5.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))) }
-                    if (convertAfterId == task.id && !task.isSeparator) ConvertGap(convertP.value, sepTakenOver)
-                    if (gapAfterId == task.id && !task.isSeparator && !takenOver) NewTaskRow(onCommit = { committedFrom = freshTaskNow; committedIds = items.map { it.id }.toSet(); onInsertAfter(task.id, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
+                    SlotLine(slotId == task.id)
                 }
+            }
+        }
+
+        // After archiving: a quiet pill with Undo, gone by itself after a few seconds.
+        LaunchedEffect(undoBanner?.id) { if (undoBanner != null) { delay(5000); onDismissUndo() } }
+        androidx.compose.animation.AnimatedVisibility(
+            visible = undoBanner != null, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = dockH + 10.dp),
+            enter = fadeIn(tween(200)) + slideInVertically(tween(260, easing = FastOutSlowInEasing)) { it / 2 },
+            exit = fadeOut(tween(200)) + slideOutVertically(tween(200, easing = FastOutSlowInEasing)) { it / 2 }
+        ) {
+            // Just the Undo button, the same one as on the focus screen.
+            Row(
+                modifier = Modifier.shadow(8.dp, CircleShape).clip(CircleShape).background(MaterialTheme.colorScheme.surface)
+                    .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
+                    .clickable { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.UNDO); onUndo() }
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Outlined.Undo, contentDescription = "Undo archive", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Undo", style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold), color = MaterialTheme.colorScheme.primary)
             }
         }
 
@@ -1726,7 +1605,9 @@ fun HomeScreen(
                 Box(
                     modifier = Modifier.size(40.dp).clip(btnShape).clickable {
                         triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.ADD)
-                        onAddSeparator(input.trim()); input = ""
+                        val label = input.trim(); input = ""
+                        val s = slotId
+                        if (s != null) { onInsertSeparatorAt(s, label) {}; finishPlacing() } else onAddSeparator(label)
                     },
                     contentAlignment = Alignment.Center
                 ) {
@@ -1749,20 +1630,6 @@ fun HomeScreen(
 
     items.firstOrNull { it.id == editingId }?.let { t ->
         TaskEditorSheet(task = t, subtasks = subtasksByTask[t.id].orEmpty(), actions = editor, onClose = { editingId = null })
-    }
-
-    if (confirmArchiveAll) {
-        val n = items.count { !it.isSeparator }
-        AlertDialog(
-            onDismissRequest = { confirmArchiveAll = false },
-            containerColor = MaterialTheme.colorScheme.surface,
-            title = { Text("Archive everything?") },
-            text = { Text("This moves all $n ${if (n == 1) "task" else "tasks"} on this list to the archive and removes the separators. You can send the tasks back from there.") },
-            confirmButton = {
-                TextButton(onClick = { confirmArchiveAll = false; triggerHaptic(context, HapticStyle.CONFIRM); Sfx.play(Sound.SWEEP); onArchiveAll() }) { Text("Archive all", color = MaterialTheme.colorScheme.primary) }
-            },
-            dismissButton = { TextButton(onClick = { confirmArchiveAll = false }) { Text("Cancel", color = MaterialTheme.colorScheme.onSurfaceVariant) } }
-        )
     }
 
     editingSeparator?.let { sep ->
@@ -1816,7 +1683,7 @@ fun SeparatorEditorSheet(task: TaskEntity, onSave: (String) -> Unit, onRemove: (
 /** A divider line with an optional label. Hold it to move it, tap to rename, swipe left to take it away. */
 @Composable
 fun SeparatorRow(
-    task: TaskEntity, fresh: Boolean, isDragging: Boolean, hidden: Boolean, modifier: Modifier, dragTranslation: () -> Float,
+    task: TaskEntity, fresh: Boolean, freshDelay: Int, isDragging: Boolean, hidden: Boolean, modifier: Modifier, dragTranslation: () -> Float,
     onEdit: () -> Unit, onDelete: () -> Unit, onDragStart: () -> Unit, onDrag: (Float) -> Unit, onDragEnd: () -> Unit
 ) {
     val context = LocalContext.current
@@ -1825,9 +1692,11 @@ fun SeparatorRow(
     val lightPage = MaterialTheme.colorScheme.background.luminance() > 0.5f
     val outline = if (lightPage) Color(0xFFD4D4D8) else Color.White.copy(alpha = 0.17f)
     val shape = RoundedCornerShape(16.dp)
-    // A separator made by the hold gesture fades in where the gap opened.
+    // A separator placed by tapping a spot fades in and settles down from just above.
     var appeared by remember(task.id) { mutableStateOf(!fresh) }
-    LaunchedEffect(task.id) { appeared = true }
+    LaunchedEffect(task.id) { if (!appeared) delay(freshDelay.toLong()); appeared = true }
+    val rise by animateFloatAsState(if (appeared) 0f else 1f, tween(420, easing = FastOutSlowInEasing), label = "sepRise")
+    val risePx = with(LocalDensity.current) { 10.dp.toPx() }
     val alpha by animateFloatAsState(if (hidden || !appeared) 0f else 1f, tween(if (appeared && !hidden && fresh) 450 else 440, easing = FastOutSlowInEasing), label = "sepAlpha")
     val swipe = remember { Animatable(0f) }
     val threshold = with(LocalDensity.current) { 110.dp.toPx() }
@@ -1857,7 +1726,7 @@ fun SeparatorRow(
                     onHorizontalDrag = { change, delta -> change.consume(); scope.launch { swipe.snapTo((swipe.value + delta).coerceAtMost(0f)) } }
                 )
             }
-            .graphicsLayer { translationX = swipe.value; translationY = if (isDragging) dragTranslation() else 0f; this.alpha = alpha * (1f + swipe.value / (size.width.coerceAtLeast(1f))).coerceIn(0f, 1f) }
+            .graphicsLayer { translationX = swipe.value; translationY = (if (isDragging) dragTranslation() else 0f) - rise * risePx; this.alpha = alpha * (1f + swipe.value / (size.width.coerceAtLeast(1f))).coerceIn(0f, 1f) }
             // The lifted card (while moving or sliding away) includes the breathing room above and below the line.
             .then(if (isDragging) Modifier.shadow(12.dp, shape).background(MaterialTheme.colorScheme.surface, shape) else if (swipe.value < -1f) Modifier.background(MaterialTheme.colorScheme.surface, shape) else Modifier)
             .padding(vertical = 10.dp),
@@ -1908,81 +1777,26 @@ fun InWindowSheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> 
     }
 }
 
-/** The blank row that opens between two tasks: the keyboard is up and the cursor is ready. Enter saves it; leaving it empty drops it. */
-@Composable
-fun NewTaskRow(onCommit: (String) -> Unit, onCancel: () -> Unit, active: Boolean = true, refocus: Any? = null, onPlaced: (androidx.compose.ui.geometry.Rect?) -> Unit = {}) {
-    var v by remember { mutableStateOf("") }
-    val focus = remember { androidx.compose.ui.focus.FocusRequester() }
-    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
-    var hadFocus by remember { mutableStateOf(false) }
-    var focused by remember { mutableStateOf(false) }
-    var lostFocusAt by remember { mutableLongStateOf(0L) }
-    var done by remember { mutableStateOf(false) }
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    val appear = remember { Animatable(0f) }
-    val finish = { if (!done) { done = true; val t = v.trim(); if (t.isEmpty()) onCancel() else onCommit(t) } }
-    // Moving the row (or removing it from outside) is not the user finishing it, so a focus loss during disposal must not cancel anything.
-    DisposableEffect(Unit) { onDispose { done = true; onPlaced(null) } }
-    // Losing focus finishes the row, but only if it stays lost: being moved above/below its separator drops focus for a moment, then we take it back.
-    LaunchedEffect(lostFocusAt) {
-        if (lostFocusAt == 0L) return@LaunchedEffect
-        delay(220)
-        if (!focused && !done) finish()
-    }
-    LaunchedEffect(refocus) { if (refocus != null && active) { delay(80); if (!focused && !done) { focus.requestFocus(); keyboard?.show() } } }
-    LaunchedEffect(Unit) { appear.animateTo(1f, tween(220)) }
-    LaunchedEffect(active) { if (active) { delay(60); focus.requestFocus(); keyboard?.show() } }
-    // Back finishes the row: what was typed is kept, an empty row is dropped (it used to throw the text away).
-    BackHandler { finish() }
-    // Back closes the keyboard first; that same press should also drop an empty row (or keep what was typed), so watch the keyboard going away.
-    val imeInsets = androidx.compose.foundation.layout.WindowInsets.ime
-    val rowDensity = LocalDensity.current
-    LaunchedEffect(Unit) {
-        var seen = false
-        androidx.compose.runtime.snapshotFlow { imeInsets.getBottom(rowDensity) }.collectLatest { b -> if (b > 0) seen = true else if (seen) { delay(450); if (!done) finish() } }
-    }
-    Row(Modifier.fillMaxWidth().onGloballyPositioned { onPlaced(androidx.compose.ui.geometry.Rect(it.positionInRoot(), androidx.compose.ui.geometry.Size(it.size.width.toFloat(), it.size.height.toFloat()))) }.graphicsLayer { alpha = appear.value }.padding(start = 8.dp), verticalAlignment = Alignment.Top) {
-        Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
-            Box(Modifier.size(22.dp).border(1.5.dp, muted.copy(alpha = 0.35f), CheckShape))
-        }
-        BasicTextField(
-            value = v, onValueChange = { v = it.replace("\n", "") }, singleLine = true,
-            textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 21.sp, fontWeight = FontWeight.Medium, letterSpacing = (-0.25).sp, color = MaterialTheme.colorScheme.onBackground),
-            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Done),
-            keyboardActions = KeyboardActions(onDone = { finish() }),
-            modifier = Modifier.weight(1f).padding(start = 6.dp, end = 18.dp, top = 14.dp, bottom = 14.dp).focusRequester(focus)
-                .onFocusChanged { focused = it.isFocused; if (it.isFocused) hadFocus = true else if (hadFocus) lostFocusAt = System.currentTimeMillis() },
-            decorationBox = { inner ->
-                Box { if (v.isEmpty()) Text("New task", style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 21.sp, letterSpacing = (-0.25).sp, fontWeight = FontWeight.Medium), color = muted.copy(alpha = 0.5f)); inner() }
-            }
-        )
-    }
-}
-
-/**
- * What is left of an abandoned "new to-do" row while it turns into a separator. Until the separator exists it holds the full row height;
- * from then on it fades out and gives its extra height back (the separator is shorter), while the separator fades in over the same spot.
- */
 /** Pseudo seam id for the empty space above the first to-do. */
 const val TOP_SEAM = -1L
 
+/** The yellow line that marks where the next typed to-dos or separator will land: a thin inset line that only fades in and out, never moves. */
 @Composable
-fun ConvertGap(progress: Float, separatorHere: Boolean) {
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    val p = if (separatorHere) progress else 0f
-    // With the separator present (34dp) the total space shrinks from 49dp to 34dp, so this spacer only carries the difference.
-    val h = if (separatorHere) 15f * (1f - p) else 49f
-    Box(Modifier.fillMaxWidth().height(h.dp)) {
-        Row(
-            Modifier.fillMaxWidth().wrapContentHeight(align = Alignment.Top, unbounded = true).graphicsLayer { alpha = 1f - p }.padding(start = 8.dp),
-            verticalAlignment = Alignment.Top
-        ) {
-            Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
-                Box(Modifier.size(22.dp).border(1.5.dp, muted.copy(alpha = 0.35f), CheckShape))
-            }
-            Text("New task", modifier = Modifier.padding(start = 6.dp, top = 14.dp), style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, fontWeight = FontWeight.Medium), color = muted.copy(alpha = 0.5f))
-        }
+fun SlotLine(visible: Boolean) {
+    // Fade in 110ms, out 80ms (leaving is quicker than arriving). The gap that makes room for it moves at the same pace.
+    val ms = if (visible) 110 else 80
+    // Yellow on the dark lists; on the light Day list (pastel yellow page) yellow would vanish, so it is the same near-black as the text there.
+    val lightPage = MaterialTheme.colorScheme.background.luminance() > 0.5f
+    val lineColor = if (lightPage) MaterialTheme.colorScheme.onBackground.copy(alpha = 0.85f) else MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
+    val a by animateFloatAsState(if (visible) 1f else 0f, tween(ms, easing = FastOutSlowInEasing), label = "slotLineA")
+    val h by animateDpAsState(if (visible) 14.dp else 0.dp, tween(ms, easing = FastOutSlowInEasing), label = "slotLineH")
+    if (h > 0.05.dp || visible) Box(Modifier.fillMaxWidth().height(h)) {
+        // Pinned to where the gap ends up (its middle), so while the gap opens or closes the line stays put and only its opacity changes.
+        Box(
+            Modifier.fillMaxWidth().wrapContentHeight(align = Alignment.Top, unbounded = true).padding(top = 6.dp)
+                .padding(horizontal = 20.dp).height(1.5.dp).graphicsLayer { alpha = a }
+                .clip(CircleShape).background(lineColor)
+        )
     }
 }
 
@@ -1995,7 +1809,7 @@ val FOCUS_TITLE_X = 28.dp
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun TaskRow(
-    task: TaskEntity, subtasks: List<SubtaskEntity>, onOpen: () -> Unit, onSelect: (Float) -> Unit, autoSelect: Boolean, selection: Int, focusX: Float, minY: Float, maxY: Float, morphY: Float, isDragging: Boolean, modifier: Modifier,
+    task: TaskEntity, subtasks: List<SubtaskEntity>, onOpen: () -> Unit, onSelect: (Float) -> Unit, autoSelect: Boolean, selection: Int, focusX: Float, minY: Float, maxY: Float, morphY: Float, isDragging: Boolean, modifier: Modifier, fresh: Boolean = false, freshDelay: Int = 0,
     dragTranslation: () -> Float, onCheck: () -> Unit, onArchive: () -> Unit, onToggleSub: (SubtaskEntity) -> Unit,
     onDragStart: () -> Unit, onDrag: (Float) -> Unit, onDragEnd: () -> Unit
 ) {
@@ -2010,6 +1824,11 @@ fun TaskRow(
     val shape = RoundedCornerShape(16.dp)
     // 1 = other rows fade away; 2 = the tapped row keeps its title and lets everything else go.
     val rowAlpha by animateFloatAsState(if (selection == 1) 0f else 1f, tween(440, easing = FastOutSlowInEasing), label = "rowAlpha")
+    // A to-do placed by tapping a spot fades in and settles down from just above, one after another when several arrive together.
+    var appeared by remember(task.id) { mutableStateOf(!fresh) }
+    LaunchedEffect(task.id) { if (!appeared) delay(freshDelay.toLong()); appeared = true }
+    val appear by animateFloatAsState(if (appeared) 1f else 0f, tween(380, easing = FastOutSlowInEasing), label = "rowAppear")
+    val risePx = with(LocalDensity.current) { 10.dp.toPx() }
     val partsAlpha by animateFloatAsState(if (selection == 2) 0f else 1f, tween(440, easing = FastOutSlowInEasing), label = "partsAlpha")
     val morph by animateFloatAsState(if (selection == 2) 1f else 0f, tween(440, easing = FastOutSlowInEasing), label = "morph")
     var titleOrigin by remember { mutableStateOf(Offset.Zero) }
@@ -2086,7 +1905,7 @@ fun TaskRow(
                     }
                 }
             }
-            .graphicsLayer { translationX = swipe.value; translationY = if (isDragging) dragTranslation() else 0f; alpha = rowAlpha * (1f - archivePop.value * 0.85f) * (1f - (-swipe.value / (size.width.coerceAtLeast(1f))).coerceIn(0f, 1f) * 0.5f) }
+            .graphicsLayer { translationX = swipe.value; translationY = (if (isDragging) dragTranslation() else 0f) - (1f - appear) * risePx; alpha = appear * rowAlpha * (1f - archivePop.value * 0.85f) * (1f - (-swipe.value / (size.width.coerceAtLeast(1f))).coerceIn(0f, 1f) * 0.5f) }
             .then(if (isDragging) Modifier.shadow(12.dp, shape).background(surface, shape) else Modifier)
             .padding(start = 8.dp),
         // Top-aligned: the check box and drag handle stay level with the title line, however many steps sit below it.
@@ -2112,7 +1931,7 @@ fun TaskRow(
         Column(modifier = Modifier.weight(1f).combinedClickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onOpen, onDoubleClick = { onSelect(titleOrigin.y.coerceIn(minY, maxY)) }).padding(start = 6.dp, end = 18.dp, top = 14.dp, bottom = 14.dp)) {
             Text(
                 task.title,
-                style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 21.sp, fontWeight = FontWeight.Medium, letterSpacing = (-0.25).sp),
+                style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 21.sp, fontWeight = if (MaterialTheme.colorScheme.background.luminance() > 0.5f) FontWeight.Normal else FontWeight.Medium, letterSpacing = (-0.25).sp),
                 color = if (checked) muted.copy(alpha = 0.45f) else onBg,
                 textDecoration = if (checked) TextDecoration.LineThrough else TextDecoration.None,
                 modifier = Modifier

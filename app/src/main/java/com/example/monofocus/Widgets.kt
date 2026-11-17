@@ -52,6 +52,7 @@ private val WText = Color(0xFFF2F2F2)
 private val WMuted = Color(0xFF8E8E93)
 private val WAccent = Color(0xFFFFEA00)
 private val TaskIdKey = ActionParameters.Key<Long>("taskId")
+private val SubIdKey = ActionParameters.Key<Long>("subId")
 
 fun currentPlaylist(context: Context): String =
     context.getSharedPreferences("mono_prefs", Context.MODE_PRIVATE).getString("playlist", "main") ?: "main"
@@ -135,6 +136,16 @@ class ToggleTaskAction : ActionCallback {
     }
 }
 
+/** Checks or unchecks one step (sub-item) of a to-do straight from the widget. */
+class ToggleSubtaskAction : ActionCallback {
+    override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
+        val id = parameters[SubIdKey] ?: return
+        val dao = AppDatabase.get(context).taskDao()
+        dao.allSubtasksOnce().firstOrNull { it.id == id }?.let { dao.updateSubtask(it.copy(isDone = !it.isDone)) }
+        updateAllWidgets(context)
+    }
+}
+
 class NextTaskAction : ActionCallback {
     override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
         val id = parameters[TaskIdKey] ?: return
@@ -149,11 +160,14 @@ class ListWidget : GlanceAppWidget() {
     override suspend fun provideGlance(context: Context, id: GlanceId) {
         applyDailyResets(context)
         val initial = listFlow(context, active = false).first()
+        val initialSubs = AppDatabase.get(context).taskDao().getAllSubtasks().first()
         val openApp = actionStartActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         provideContent {
             // Collected live, so checking or unchecking in the app (or here) redraws the widget at once.
             val tasks by listFlow(context, active = false).collectAsState(initial)
             val shown = tasks
+            val subsByTask by AppDatabase.get(context).taskDao().getAllSubtasks().collectAsState(initialSubs)
+            val subs = subsByTask.groupBy { it.taskId }
             val tasks_left = shown.count { !it.isSeparator && !it.isCompleted }
             Column(
                 modifier = GlanceModifier.fillMaxSize().background(WBg).cornerRadius(24.dp).padding(horizontal = 16.dp, vertical = 12.dp)
@@ -176,7 +190,8 @@ class ListWidget : GlanceAppWidget() {
                                     if (t.title.isNotBlank()) { Text(t.title.uppercase(), maxLines = 1, style = TextStyle(color = ColorProvider(WMuted), fontSize = 10.sp, fontWeight = FontWeight.Medium)); Spacer(GlanceModifier.width(8.dp)) }
                                     Box(modifier = GlanceModifier.defaultWeight().height(1.dp).background(WMuted.copy(alpha = 0.35f))) {}
                                 }
-                            } else Row(modifier = GlanceModifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                            } else Column(modifier = GlanceModifier.fillMaxWidth()) {
+                            Row(modifier = GlanceModifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Image(
                                     provider = ImageProvider(if (t.isCompleted) R.drawable.ic_w_done else R.drawable.ic_w_circle), contentDescription = if (t.isCompleted) "Mark not done" else "Mark done",
                                     modifier = GlanceModifier.size(32.dp).padding(4.dp).clickable(actionRunCallback<ToggleTaskAction>(actionParametersOf(TaskIdKey to t.id)))
@@ -186,6 +201,21 @@ class ListWidget : GlanceAppWidget() {
                                     t.title + (if (t.focusSessions > 0) "  ⏱${t.focusSessions}" else ""), maxLines = 1, style = TextStyle(color = ColorProvider(if (t.isCompleted) WMuted else WText), fontSize = 15.sp),
                                     modifier = GlanceModifier.defaultWeight().clickable(openApp)
                                 )
+                            }
+                            // Its steps, indented under the title; each has its own check box.
+                            subs[t.id].orEmpty().forEach { sub ->
+                                Row(modifier = GlanceModifier.fillMaxWidth().padding(start = 40.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Image(
+                                        provider = ImageProvider(if (sub.isDone) R.drawable.ic_w_done else R.drawable.ic_w_circle), contentDescription = if (sub.isDone) "Mark step not done" else "Mark step done",
+                                        modifier = GlanceModifier.size(28.dp).padding(6.dp).clickable(actionRunCallback<ToggleSubtaskAction>(actionParametersOf(SubIdKey to sub.id)))
+                                    )
+                                    Spacer(GlanceModifier.width(6.dp))
+                                    Text(
+                                        sub.title, maxLines = 1, style = TextStyle(color = ColorProvider(if (sub.isDone) WMuted else WText), fontSize = 13.sp),
+                                        modifier = GlanceModifier.defaultWeight().clickable(openApp)
+                                    )
+                                }
+                            }
                             }
                         }
                     }

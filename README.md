@@ -11,15 +11,13 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 ### Tasks
 - **Add** – type in the bar, one task per line. The + appears only when there is text.
 - **Complete** – check it off; it stays in place, dimmed.
-- **Steps** – a task's steps show under it in every list. Tap a step's box to tick it; tap anywhere else on it to open the task's editor, just like the task itself.
+- **Steps** – a task's steps show under it in every list (and in the list widget). Tap a step's box to tick it; tap anywhere else on it to open the task's editor, just like the task itself.
 - **Reorder** – hold a task anywhere and drag it up or down. There are no drag handles.
 - **Edit** – tap a task for title, notes, steps and timer count. Native copy and paste work. Enter saves and closes.
 - **Focus** – double-tap a task to start focus on it.
-- **Insert between two tasks** – press and hold on the gap between two tasks, or in the empty space under the last one. A thin accent line opens, then a blank to-do row appears right there (the keyboard and scroll wait until you lift your finger). Enter saves it. Back, or a tap anywhere else, closes the keyboard and finishes the row in one go: text is kept, an empty row is dropped. Keep holding about two seconds in total and the empty to-do fades away while the rows slide up and a separator fades in. The typed to-do replaces its row in place, no sliding in from the bottom.
-- **Insert above the first to-do** – when the list starts with a to-do, a small empty space sits above it. Press and hold it: same as between two tasks. Let go for a new to-do at the very top, keep holding and it collapses into a separator at the top. The typed to-do replaces its row in place, with no jump, even when adding several in a row. Closing the keyboard (Back or Enter) eases the list back rather than snapping it, and Back keeps what you typed. Inserting many to-dos or separators into the same gap is handled in one step, so a new item never flashes at the bottom first. When the list starts with a separator, hold the separator instead (below).
-- **Insert next to a separator** – press and hold a separator anywhere: it lifts so you can drag it. Keep holding still for about a second and an empty to-do opens just below it; drag the separator past that row and the new to-do glides above it.
+- **Insert where you choose** – tap the empty space just above or below any to-do or separator (including above the first and below the last). A thin inset line fades in there (yellow on the dark lists, near-black on the Day list) and the rows ease apart a little. Everything you add from the bar now goes into that spot: a to-do, several lines at once (in order, fading in one after another), or a separator via the dash button (the typed text becomes its label). When it is in, the line lets go and the keyboard hides. Tap the line again to deselect it; it also lets go by itself after 12 seconds of nothing happening (typing and adding keep it alive), when you switch lists, or when you open a task. With no spot chosen, adding still appends to the bottom. Taps near a row's edge choose the spot instead of opening that row; tap the middle of a row to open it.
 - **Add bar** – one task per line. Markdown is understood: bullets (`-`, `*`, `+`, `1.`), checklists (`- [ ]`, `- [x]`), and `**bold**`, `~~strike~~` and backticks are stripped. A ticked box or a ~~crossed out~~ item arrives already done.
-- **Archive** – swipe left on a task, or archive the whole list from the top bar (it asks first). Archiving the whole list also deletes its separators.
+- **Archive** – swipe left on a task, or tap the archive icon in the top bar to archive the whole list. Neither asks first: an Undo button (the same one as on the focus screen) floats above the add bar for 5 seconds and puts everything back exactly where it was, separators included. Archiving the whole list removes its separators until you undo.
 - **Nothing archives itself.**
 
 ### Separators
@@ -49,6 +47,7 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 ### Lists
 - **Main, Morning, Night, Cleaning** – each with its own tasks and colour.
 - **Switch** – tap the sun or moon; tap again, or use the back arrow or the system Back, to return to Main.
+- **Light pages** – on the light Day list, task titles use a lighter weight than on the dark lists.
 - **Dock** – the list scrolls underneath it, so text shows in the transparent corners beside the tab.
 - **Wash transition** – the new colour spreads from the button.
 - **Daily reset** – Morning and Night uncheck themselves at times you choose.
@@ -80,7 +79,7 @@ Pull the list down from the top to open them. Settings and Archive always use th
 
 ### Phone
 - **Keep awake (eye)** – keeps the screen on, but locks the phone behind it. It turns on by itself when you start a task in Morning or Night, and stays on when you go back to the list or other screens. If the phone gets unlocked while it is on, coming back to the app locks it again. Rotating while it is on no longer flickers. Turn it off with the eye icon in focus, or the one in the list header.
-- **Widgets** – a list widget (check and uncheck) and a focus widget; both always show the Main list and update live.
+- **Widgets** – a list widget (check and uncheck to-dos, with each to-do's steps shown under it and tickable too) and a focus widget; both always show the Main list and update live.
 - **Sleep countdown** – an optional silent, top-ranked notification (also on the lock screen), one compact row: a small bed on the left, the time left until your sleep time on the right. It starts minimized and its colours step through four stages: black with a yellow time (more than 3 hours left); deep teal `#053837` with a yellow time and a lighter bed (3h to 2h); bright mint `#00E092` with black time and bed (2h to 1h); and the app's yellow with black time and bed for the last hour. After bedtime it says "Bedtime" for 3 hours. Needs the notification permission; it runs as a small foreground service, refreshed each minute and when the screen turns on.
 
 ## Build
