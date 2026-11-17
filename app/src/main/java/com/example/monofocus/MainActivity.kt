@@ -416,7 +416,7 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         if (t.isEmpty()) return
         viewModelScope.launch {
             val at = todayList.value.indexOfFirst { it.id == afterId }
-            insertTaskAt(if (at >= 0) at + 1 else todayList.value.size, t)
+            insertTaskAt(if (afterId == TOP_SEAM) 0 else if (at >= 0) at + 1 else todayList.value.size, t)
         }
     }
 
@@ -462,7 +462,10 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
             val at = list.indexOfFirst { it.id == afterId }
             val lo = list.getOrNull(at)?.queueOrder
             val hi = list.getOrNull(at + 1)?.queueOrder
-            if (lo != null && hi != null && hi - lo > 1) {
+            if (afterId == TOP_SEAM && hi != null) {
+                // The empty space above the first to-do: the separator goes to the very top.
+                freshSepId = dao.insert(TaskEntity(title = "", queueOrder = hi - 10L, playlist = _playlist.value, isSeparator = true))
+            } else if (lo != null && hi != null && hi - lo > 1) {
                 val id = dao.insert(TaskEntity(title = "", queueOrder = lo + (hi - lo) / 2, playlist = _playlist.value, isSeparator = true))
                 freshSepId = id
             } else {
@@ -1326,7 +1329,9 @@ fun HomeScreen(
                     val sepIds = items.filter { it.isSeparator }.map { it.id }.toSet()
                     // A press anywhere on a separator belongs to the separator: hold to drag it, keep holding to open a new to-do beside it.
                     val sepMiddle = vis.any { it.key in sepIds && y >= it.offset && y <= it.offset + it.size }
-                    if (sepMiddle) { sepHoldKey = vis.firstOrNull { it.key in sepIds && y > it.offset && y < it.offset + it.size }?.key as? Long; null }
+                    val slot = vis.firstOrNull { it.key == "top-slot" }
+                    if (slot != null && slot.size > 0 && y <= slot.offset + slot.size && !sepMiddle) TOP_SEAM
+                    else if (sepMiddle) { sepHoldKey = vis.firstOrNull { it.key in sepIds && y > it.offset && y < it.offset + it.size }?.key as? Long; null }
                     else {
                         val last = vis.lastOrNull()
                         val belowLast = if (last != null && last.key == items.lastOrNull()?.id && y > last.offset + last.size - spreadTol) last.key else null
@@ -1522,6 +1527,17 @@ fun HomeScreen(
                 Text(if (playlist == "cleaning") "Add tiny 2-minute cleans here." else "Nothing to do.", modifier = Modifier.align(Alignment.Center), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { translationY = pull }, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp + dockH)) {
+                item(key = "top-slot") {
+                    val first = items.firstOrNull()
+                    val convertingTop = convertAfterId == TOP_SEAM
+                    val slotH = if (convertingTop && sepTakenOver) 24f * (1f - convertP.value) else if (first != null && !first.isSeparator) 24f else 0f
+                    Column(Modifier.fillMaxWidth()) {
+                        Spacer(Modifier.fillMaxWidth().height(animateDpAsState(slotH.dp, tween(200), label = "slotH").value))
+                        if (spreadAfterId == TOP_SEAM) Box(Modifier.fillMaxWidth().height(2.dp + 49.dp * spreadAmount)) { Box(Modifier.fillMaxWidth().height(1.5.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))) }
+                        if (gapAfterId == TOP_SEAM && !rowTakenOver) NewTaskRow(onCommit = { committedFrom = freshTaskNow; onInsertAfter(TOP_SEAM, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
+                        if (convertingTop) ConvertGap(convertP.value, sepTakenOver)
+                    }
+                }
                 items(items, key = { it.id }) { task ->
                     // Once a typed-in task exists in the list, its real row takes the place of the typing row in the same frame (no gap, no sliding).
                     val takenOver = rowTakenOver
@@ -1565,7 +1581,7 @@ fun HomeScreen(
                                 else if (above != null && top < above.offset + above.size / 2f) above else null
                             if (target != null) {
                                 val from = items.indexOfFirst { it.id == task.id }
-                                val to = target.index
+                                val to = target.index - 1   // row 0 of the lazy list is the top slot
                                 if (from >= 0 && to >= 0 && to < items.size && to != from) {
                                     items.add(to, items.removeAt(from))
                                     triggerHaptic(context, HapticStyle.TICK)
@@ -1590,6 +1606,18 @@ fun HomeScreen(
                     if (task.isSeparator) {
                         // One new-to-do row that can sit above or below its separator (the separator can be dragged past it) without losing what was typed or its focus.
                         val newRow = remember(task.id) { movableContentOf {
+                            // When the separator is dragged past it, the row glides to its new side instead of jumping.
+                            val glide = remember { Animatable(0f) }
+                            val sepPx = with(density) { 34.dp.toPx() }
+                            var lastBefore by remember { mutableStateOf(gapBefore) }
+                            LaunchedEffect(gapBefore) {
+                                if (gapBefore != lastBefore) {
+                                    lastBefore = gapBefore
+                                    glide.snapTo(if (gapBefore) sepPx else -sepPx)
+                                    glide.animateTo(0f, tween(220, easing = FastOutSlowInEasing))
+                                }
+                            }
+                            Box(Modifier.graphicsLayer { translationY = glide.value }) {
                             NewTaskRow(
                                 onCommit = { committedFrom = freshTaskNow; if (gapBefore) onInsertBefore(task.id, it) else onInsertAfter(task.id, it) },
                                 onCancel = { gapAfterId = null; gapBefore = false },
@@ -1597,6 +1625,7 @@ fun HomeScreen(
                                 refocus = gapBefore,
                                 onPlaced = { newRowBounds = it }
                             )
+                            }
                         } }
                         if (gapAfterId == task.id && gapBefore && !takenOver) newRow()
                         SeparatorRow(
@@ -1781,7 +1810,7 @@ fun SeparatorRow(
     val scope = rememberCoroutineScope()
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val lightPage = MaterialTheme.colorScheme.background.luminance() > 0.5f
-    val outline = if (lightPage) Color(0xFFB8B8BC) else Color.White.copy(alpha = 0.32f)
+    val outline = if (lightPage) Color(0xFFD4D4D8) else Color.White.copy(alpha = 0.17f)
     val shape = RoundedCornerShape(16.dp)
     // A separator made by the hold gesture fades in where the gap opened.
     var appeared by remember(task.id) { mutableStateOf(!fresh) }
@@ -1826,7 +1855,7 @@ fun SeparatorRow(
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (task.title.isNotBlank()) {
-                Text(task.title.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.6.sp, fontWeight = FontWeight.Medium), color = if (lightPage) Color(0xFF8A8A8F) else muted.copy(alpha = 0.75f), modifier = Modifier.widthIn(max = 240.dp))
+                Text(task.title.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.6.sp, fontWeight = FontWeight.Medium), color = if (lightPage) Color(0xFFAAAAAE) else muted.copy(alpha = 0.45f), modifier = Modifier.widthIn(max = 240.dp))
                 Spacer(Modifier.width(12.dp))
             }
             Box(Modifier.weight(1f).height(1.dp).background(outline))
@@ -1911,7 +1940,7 @@ fun NewTaskRow(onCommit: (String) -> Unit, onCancel: () -> Unit, active: Boolean
             modifier = Modifier.weight(1f).padding(start = 6.dp, end = 18.dp, top = 14.dp, bottom = 14.dp).focusRequester(focus)
                 .onFocusChanged { focused = it.isFocused; if (it.isFocused) hadFocus = true else if (hadFocus) lostFocusAt = System.currentTimeMillis() },
             decorationBox = { inner ->
-                Box { if (v.isEmpty()) Text("New task", style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, fontWeight = FontWeight.Medium), color = muted.copy(alpha = 0.5f)); inner() }
+                Box { if (v.isEmpty()) Text("New task", style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 21.sp, letterSpacing = (-0.25).sp, fontWeight = FontWeight.Medium), color = muted.copy(alpha = 0.5f)); inner() }
             }
         )
     }
@@ -1921,6 +1950,9 @@ fun NewTaskRow(onCommit: (String) -> Unit, onCancel: () -> Unit, active: Boolean
  * What is left of an abandoned "new to-do" row while it turns into a separator. Until the separator exists it holds the full row height;
  * from then on it fades out and gives its extra height back (the separator is shorter), while the separator fades in over the same spot.
  */
+/** Pseudo seam id for the empty space above the first to-do. */
+const val TOP_SEAM = -1L
+
 @Composable
 fun ConvertGap(progress: Float, separatorHere: Boolean) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
