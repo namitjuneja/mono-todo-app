@@ -1077,7 +1077,12 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                             }
                         }
                     },
-                    onExitFocus = { pendingUndo = null; returnId = if (diceSession) null else focusTask?.id; diceSession = false; screen = ScreenState.HOME }
+                    onExitFocus = { pendingUndo = null; returnId = if (diceSession) null else focusTask?.id; diceSession = false; screen = ScreenState.HOME },
+                    onOpenCleaning = {
+                        pendingUndo = null; diceSession = false; returnId = null; focusedId = null; screen = ScreenState.HOME
+                        val dm = appContext.resources.displayMetrics
+                        switchPlaylist("cleaning", Offset(dm.widthPixels / 2f, dm.heightPixels - 90f * dm.density))
+                    }
                 )
                 ScreenState.ARCHIVE -> ArchiveScreen(
                     archivedTasks = archivedTasks, onRestore = viewModel::undoCompleteTask, onClearArchive = viewModel::clearArchive, onBack = { screen = ScreenState.SETTINGS }
@@ -1297,43 +1302,9 @@ fun HomeScreen(
     LaunchedEffect(playlist, selectingId) { slotId = null }
     LaunchedEffect(items.size) { delay(400); val s = slotId; if (s != null && s != TOP_SEAM && items.none { it.id == s }) slotId = null }
 
-    // While the keyboard is up the list is nudged just enough to keep the marked line in view, and nudged back the moment the keyboard
-    // goes away or the spot is let go. Both moves are one smooth glide; if you scroll yourself the list stays where you put it.
-    var imeUp by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { snapshotFlow { imeInsets.getBottom(density) > 0 }.collect { imeUp = it } }
-    var adjustPx by remember { mutableFloatStateOf(0f) }   // how far we have scrolled the list for the line
-    LaunchedEffect(Unit) { snapshotFlow { listState.isScrollInProgress }.collect { if (it) adjustPx = 0f } }
-    suspend fun glide(delta: Float) {
-        var last = 0f
-        animate(0f, delta, animationSpec = tween(320, easing = FastOutSlowInEasing)) { v, _ -> adjustPx += listState.dispatchRawDelta(v - last); last = v }
-    }
-    // Restoring is keyed on "should the list be back where it was" (spot let go, or keyboard gone), so it never restarts mid-glide.
-    val restoreNow = slotId == null || !imeUp
-    LaunchedEffect(slotId, restoreNow) {
-        val s = slotId
-        if (restoreNow) {
-            if (adjustPx != 0f) {
-                // Let the keyboard finish going down first, then glide the list back.
-                var k = 0
-                while (imeInsets.getBottom(density) > 0 && k < 25) { delay(40); k++ }
-                delay(40)
-                val back = adjustPx
-                if (back != 0f) glide(-back)
-            }
-            return@LaunchedEffect
-        }
-        if (committing || s == null) return@LaunchedEffect   // rows are arriving: the list stays put
-        // Wait for the keyboard to finish rising, then bring the line into view only if it is hidden or too close to the dock.
-        var prev = -1
-        for (k in 0 until 25) { val b = imeInsets.getBottom(density); if (b > 0 && b == prev) break; prev = b; delay(60) }
-        delay(60)
-        val info = listState.layoutInfo
-        val key: Any = if (s == TOP_SEAM) "top-slot" else s
-        val item = info.visibleItemsInfo.firstOrNull { it.key == key } ?: return@LaunchedEffect
-        val lineY = item.offset + item.size - with(density) { 7.dp.toPx() } + info.beforeContentPadding
-        val bottomEdge = info.viewportSize.height - with(density) { dockH.toPx() }
-        if (lineY > bottomEdge - with(density) { 96.dp.toPx() } || lineY < with(density) { 24.dp.toPx() }) glide(lineY - bottomEdge * 0.4f)
-    }
+    // While the keyboard is up the list is nudged just enough to keep the marked line in view, and glides back afterwards (see SlotScroll).
+    val imeUp = rememberImeUp()
+    SlotScroll(slotId, committing, listState, dockH, imeUp)
     val seamTol = remember(density) { with(density) { 12.dp.toPx() } }
     val gapHalf = remember(density) { with(density) { 7.dp.toPx() } }
     fun it_seam(i: androidx.compose.foundation.lazy.LazyListItemInfo, marked: Long?, half: Float): Float = i.offset + i.size - (if (i.key == marked) half else 0f)
@@ -1599,6 +1570,18 @@ fun HomeScreen(
             }
         }
 
+        // ---- The add bar doubles as the list switcher (the logic lives in BarSwitcher) ----
+        val switcherIcons = remember { listOf(Icons.Outlined.Checklist, Icons.Outlined.WbTwilight, Icons.Outlined.Bedtime, Icons.Outlined.Casino) }
+        val switcherNames = remember { listOf("Main list", "Morning list", "Night list", "Roll a random clean") }
+        val currentListIdx = when (playlist) { "morning" -> 1; "night" -> 2; "cleaning" -> 3; else -> 0 }   // the dice sits on the cleaning list
+        val sw = rememberBarSwitcher(
+            canStart = input.isEmpty() && !imeUp && selectingId == null, currentIdx = currentListIdx,
+            onTap = { barFocus.requestFocus(); keyboardCtl?.show() },
+            onSwitch = { idx, center -> when (idx) { 0 -> onPlaylist("main", center); 1 -> onPlaylist("morning", center); 2 -> onPlaylist("night", center); else -> onRoll() } }
+        )
+        // The bar's contents and the switcher swap with one quick crossfade (the app's usual short fade).
+        val switcherAlpha by animateFloatAsState(if (sw.open) 1f else 0f, tween(if (sw.open) 200 else 160, easing = FastOutSlowInEasing), label = "switcherAlpha")
+
         // After archiving: a quiet pill with Undo, gone by itself after a few seconds.
         LaunchedEffect(undoBanner?.id) { if (undoBanner != null) { delay(5000); onDismissUndo() } }
         androidx.compose.animation.AnimatedVisibility(
@@ -1621,43 +1604,35 @@ fun HomeScreen(
         }
 
         Column(modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().onSizeChanged { dockH = with(density) { it.height.toDp() } }.graphicsLayer { alpha = chromeAlpha }.navigationBarsPadding().imePadding().padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 8.dp)) {
-            // One shape, one outline: the bar with a raised centre tab that holds the list buttons. The tab sits above the text area, never over it.
-            val dockDensity = LocalDensity.current
-            val dockShape = remember(dockDensity) { DockShape(with(dockDensity) { 116.dp.toPx() }, with(dockDensity) { 48.dp.toPx() }, with(dockDensity) { 22.dp.toPx() }, with(dockDensity) { 22.dp.toPx() }) }
-            Column(Modifier.fillMaxWidth().clip(dockShape).background(MaterialTheme.colorScheme.surface).border(1.dp, MaterialTheme.colorScheme.outline, dockShape)) {
-                Box(Modifier.fillMaxWidth().height(48.dp), contentAlignment = Alignment.Center) {
-                    // Hairline between the list buttons and the text bar, across the tab only.
-                    Box(Modifier.align(Alignment.BottomCenter).width(92.dp).height(1.dp).background(MaterialTheme.colorScheme.outline.copy(alpha = 0.7f)))
-                    Row(
-                        Modifier.onGloballyPositioned { glyphRowCenter = it.positionInRoot() + Offset(it.size.width / 2f, it.size.height / 2f) },
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        PlaylistGlyphs(
-                            selected = playlist,
-                            onSelect = { k, c -> if (selectingId == null) { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.TICK); onPlaylist(k, c) } },
-                            onRoll = { if (selectingId == null) onRoll() },
-                            onCleaningToggle = { c -> if (selectingId == null) { triggerHaptic(context, HapticStyle.CONFIRM); Sfx.play(Sound.TICK); onCleaningToggle(c) } }
-                        )
-                    }
-                }
+            // One plain bar. Press and hold it (while it is empty and the keyboard is down) and it turns into the list switcher; slide to a list and let go.
+            val dockShape = RoundedCornerShape(22.dp)
+            Box(Modifier.fillMaxWidth().clip(dockShape).background(MaterialTheme.colorScheme.surface).border(1.dp, MaterialTheme.colorScheme.outline, dockShape)) {
             Row(
-                modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                modifier = Modifier.fillMaxWidth()
+                    .onGloballyPositioned { sw.barPos = it.positionInRoot(); sw.barSize = it.size; glyphRowCenter = sw.barPos + Offset(it.size.width / 2f, it.size.height / 2f) }
+                    .graphicsLayer { alpha = 1f - switcherAlpha }
+                    .padding(start = 20.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                Box(Modifier.weight(1f)) {
                 BasicTextField(
                     value = input, onValueChange = { input = it },
-                    modifier = Modifier.weight(1f).focusRequester(barFocus),
+                    modifier = Modifier.fillMaxWidth().focusRequester(barFocus),
                     textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
                     cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                     maxLines = 4,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default, capitalization = KeyboardCapitalization.Sentences),
                     decorationBox = { inner ->
                         Box(contentAlignment = Alignment.CenterStart, modifier = Modifier.padding(vertical = 8.dp)) {
-                            if (input.isEmpty()) Text("Add a task", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
+                            if (input.isEmpty()) Text(when (playlist) { "morning" -> "Add to Morning"; "night" -> "Add to Night"; "cleaning" -> "Add a tiny clean"; else -> "Add a task" }, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                             inner()
                         }
                     }
                 )
+                // While the bar is empty and the keyboard is down, this catches the touch first: a tap still opens the keyboard,
+                // a hold opens the switcher (the text field never sees the hold, so it cannot pop the keyboard up by itself).
+                if (input.isEmpty() && !imeUp && selectingId == null) Box(Modifier.matchParentSize().onGloballyPositioned { sw.overlayLeft = it.positionInRoot().x - sw.barPos.x }.then(sw.gesture))
+                }
                 val canAdd = input.isNotBlank()
                 val multiLine = input.contains('\n')   // a separator label has to be a single line
                 val btnShape = RoundedCornerShape(14.dp)
@@ -1692,6 +1667,7 @@ fun HomeScreen(
                     }
                 }
             }
+            if (switcherAlpha > 0.01f) ListSwitcher(icons = switcherIcons, names = switcherNames, current = currentListIdx, selected = sw.sel, alpha = switcherAlpha, modifier = Modifier.matchParentSize())
             }
         }
         }
@@ -2062,7 +2038,7 @@ fun TaskRow(
 fun FocusScreen(
     task: TaskEntity?, position: Int, titleY: Float, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions, onFocusSession: (Long) -> Unit, remainingCount: Int, diceMode: Boolean, morphFromList: Boolean, keepScreenOn: Boolean, sectionBanner: String?, onBannerDone: () -> Unit, medTimer: MedTimer?, medDefault: Int, onMedStart: (Int) -> Unit, onMedAdd: (Int) -> Unit, onMedClear: () -> Unit, onToggleKeepScreenOn: () -> Unit,
     onFinish: (TaskEntity, Offset) -> Unit, undoTask: TaskEntity?, onUndo: (TaskEntity) -> Unit, onUndoDismiss: () -> Unit, onMoveToNext: (TaskEntity) -> Unit, onMoveToPrev: (TaskEntity) -> Unit,
-    onExitFocus: () -> Unit
+    onExitFocus: () -> Unit, onOpenCleaning: () -> Unit = {}
 ) {
     // Everything on this screen except the title fades in while the list's text grows into place; the title swaps in when it lands.
     val entryAlpha = remember { Animatable(0f) }
@@ -2260,7 +2236,13 @@ fun FocusScreen(
                             Icon(Icons.Outlined.HelpOutline, contentDescription = "I'm stuck", tint = muted)
                         }
                         Spacer(Modifier.width(8.dp))
-                    } else Spacer(Modifier.width(60.dp))
+                    } else {
+                        // Dice focus: Back is the left-most icon.
+                        IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); exit() }, modifier = Modifier.size(52.dp)) {
+                            Icon(Icons.Outlined.ArrowBack, contentDescription = "Back to the list", tint = muted)
+                        }
+                        Spacer(Modifier.width(8.dp))
+                    }
                     val running = timerEnd != null
                     Box(
                         modifier = Modifier.size(52.dp).clip(CircleShape).clickable { if (running) timerEnd = null else startTimer() },
@@ -2303,6 +2285,13 @@ fun FocusScreen(
                         enabled = remainingCount > 1, modifier = Modifier.size(52.dp)
                     ) {
                         Icon(if (diceMode) Icons.Outlined.Casino else Icons.Outlined.ArrowForward, contentDescription = if (diceMode) "Another one" else "Next task", tint = if (remainingCount > 1) muted else muted.copy(alpha = 0.25f), modifier = Modifier.graphicsLayer { rotationZ = if (diceMode) diceSpin.value else 0f })
+                    }
+                    if (diceMode) {
+                        // Dice focus: Edit is the right-most icon and opens the cleaning list.
+                        Spacer(Modifier.width(8.dp))
+                        IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); onOpenCleaning() }, modifier = Modifier.size(52.dp)) {
+                            Icon(Icons.Outlined.Edit, contentDescription = "Edit the cleaning list", tint = muted)
+                        }
                     }
                     }
                 }
@@ -2505,69 +2494,153 @@ fun PlaylistBackdrop(playlist: String) {
     )
 }
 
-private class PlaylistGlyph(val key: String, val name: String, val off: androidx.compose.ui.graphics.vector.ImageVector, val on: androidx.compose.ui.graphics.vector.ImageVector)
+@Composable
+fun rememberImeUp(): Boolean {
+    val ime = WindowInsets.ime
+    val density = LocalDensity.current
+    var up by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { snapshotFlow { ime.getBottom(density) > 0 }.collect { up = it } }
+    return up
+}
 
 /**
- * Morning and Night, with the cleaning dice hidden off to the right (swipe left to reveal it).
- * All three are the accent colour inside a full ring. Tap the dice to roll; long-press it to open the cleaning list.
+ * Keeps the marked insert line in view while the keyboard is up, and puts the list back afterwards.
+ * Both moves are one smooth glide; if the user scrolls themselves the list stays where they put it.
+ * Pressing add runs in order: rows appear (list holds still), keyboard closes, then the list glides back.
  */
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun PlaylistGlyphs(selected: String, onSelect: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val spin = remember { Animatable(0f) }
-    val centers = remember { mutableMapOf<String, Offset>() }
-    val glyphs = remember {
-        listOf(
-            PlaylistGlyph("morning", "Morning", Icons.Outlined.WbTwilight, Icons.Filled.WbTwilight),
-            PlaylistGlyph("night", "Night", Icons.Outlined.Bedtime, Icons.Filled.Bedtime),
-            PlaylistGlyph("cleaning", "Cleaning dice", Icons.Outlined.Casino, Icons.Filled.Casino)
-        )
+fun SlotScroll(slotId: Long?, committing: Boolean, listState: androidx.compose.foundation.lazy.LazyListState, dockH: Dp, imeUp: Boolean) {
+    val ime = WindowInsets.ime
+    val density = LocalDensity.current
+    var adjustPx by remember { mutableFloatStateOf(0f) }   // how far we have scrolled the list for the line
+    LaunchedEffect(Unit) { snapshotFlow { listState.isScrollInProgress }.collect { if (it) adjustPx = 0f } }
+    suspend fun glide(delta: Float) {
+        var last = 0f
+        animate(0f, delta, animationSpec = tween(320, easing = FastOutSlowInEasing)) { v, _ -> adjustPx += listState.dispatchRawDelta(v - last); last = v }
     }
-    val ink = Color(0xFF111111)
-    val onDayPage = selected == "morning"
-    // Resting buttons are the accent yellow (a touch deeper on the light Morning page so they stay visible).
-    val rest = if (onDayPage) ink else ElectricYellow
-    // Small and close together; exactly two fit the window, the dice waits out of sight to the right.
-    Row(
-        modifier = Modifier.width(80.dp).horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically
-    ) {
-        glyphs.forEach { g ->
-            val isOn = selected == g.key
-            // Morning page: the active sun turns dark. Night / Cleaning pages: the active button fills with the accent.
-            val fill by animateColorAsState(if (isOn) rest.copy(alpha = 0.16f) else Color.Transparent, tween(250), label = "glyphFill")
-            val tint by animateColorAsState(rest.copy(alpha = if (isOn) 0.9f else 0.45f), tween(250), label = "glyphTint")
-            Box(
-                modifier = Modifier.size(32.dp)
-                    .onGloballyPositioned { centers[g.key] = it.positionInRoot() + Offset(it.size.width / 2f, it.size.height / 2f) }
-                    .clip(CircleShape)
-                    .background(fill, CircleShape)
-                    .combinedClickable(
-                        interactionSource = remember { MutableInteractionSource() }, indication = null,
-                        onClick = {
-                            if (g.key == "cleaning") {
-                                if (!spin.isRunning) scope.launch {
-                                    // The dice tumbles for a moment before it picks something.
-                                    spin.snapTo(0f)
-                                    val tumble = launch { spin.animateTo(720f, tween(620, easing = FastOutSlowInEasing)) }
-                                    repeat(3) { triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.TICK); delay(140) }
-                                    tumble.join()
-                                    onRoll()
-                                }
-                            } else onSelect(if (isOn) "main" else g.key, centers[g.key] ?: Offset.Zero)
-                        },
-                        onLongClick = { if (g.key == "cleaning") onCleaningToggle(centers[g.key] ?: Offset.Zero) }
-                    ),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    if (isOn) g.on else g.off,
-                    contentDescription = if (g.key == "cleaning") "Random tiny clean. Long-press to open the cleaning list" else if (isOn) "${g.name} list is on. Tap to go back to the main list" else "${g.name} list",
-                    tint = tint,
-                    modifier = Modifier.size(17.dp).graphicsLayer { if (g.key == "cleaning") rotationZ = spin.value }
-                )
+    // Keyed on "should the list be back where it was" (spot let go, or keyboard gone), so restoring never restarts mid-glide.
+    val restoreNow = slotId == null || !imeUp
+    LaunchedEffect(slotId, restoreNow) {
+        if (restoreNow) {
+            if (adjustPx != 0f) {
+                // Let the keyboard finish going down first, then glide the list back.
+                var k = 0
+                while (ime.getBottom(density) > 0 && k < 25) { delay(40); k++ }
+                delay(40)
+                val back = adjustPx
+                if (back != 0f) glide(-back)
+            }
+            return@LaunchedEffect
+        }
+        if (committing || slotId == null) return@LaunchedEffect   // rows are arriving: the list stays put
+        // Wait for the keyboard to finish rising, then bring the line into view only if it is hidden or too close to the dock.
+        var prev = -1
+        for (k in 0 until 25) { val b = ime.getBottom(density); if (b > 0 && b == prev) break; prev = b; delay(60) }
+        delay(60)
+        val info = listState.layoutInfo
+        val key: Any = if (slotId == TOP_SEAM) "top-slot" else slotId
+        val item = info.visibleItemsInfo.firstOrNull { it.key == key } ?: return@LaunchedEffect
+        val lineY = item.offset + item.size - with(density) { 7.dp.toPx() } + info.beforeContentPadding
+        val bottomEdge = info.viewportSize.height - with(density) { dockH.toPx() }
+        if (lineY > bottomEdge - with(density) { 96.dp.toPx() } || lineY < with(density) { 24.dp.toPx() }) glide(lineY - bottomEdge * 0.4f)
+    }
+}
+
+/**
+ * Press and hold the empty add bar and it becomes the list switcher: slide to a glyph and let go.
+ * Kept out of HomeScreen (which is already huge) so that function stays small enough to compile and verify.
+ */
+@Stable
+class BarSwitcher {
+    var open by mutableStateOf(false)
+    var sel by mutableIntStateOf(0)
+    var overlayLeft by mutableFloatStateOf(0f)
+    var barPos by mutableStateOf(Offset.Zero)
+    var barSize by mutableStateOf(androidx.compose.ui.unit.IntSize.Zero)
+    var canStart = false
+    var current = 0
+    var onTap: () -> Unit = {}
+    var onSwitch: (Int, Offset) -> Unit = { _, _ -> }
+    var scope: kotlinx.coroutines.CoroutineScope? = null
+    var context: Context? = null
+
+    private fun commit(idx: Int) {
+        scope?.launch {
+            context?.let { triggerHaptic(it, HapticStyle.CONFIRM) }; Sfx.play(Sound.TICK)
+            delay(150)   // let the highlight settle on the choice
+            val center = barPos + Offset((idx + 0.5f) / 4f * barSize.width, barSize.height / 2f)
+            open = false   // the bar fades back in as the page changes
+            onSwitch(idx, center)
+        }
+    }
+
+    val gesture: Modifier = Modifier.pointerInput(Unit) {
+        awaitEachGesture {
+            val first = awaitFirstDown(requireUnconsumed = false, pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+            if (!canStart || open) return@awaitEachGesture
+            // Only a steady hold counts; a tap (to type) or a drag is left alone.
+            var steady = true
+            var tapped = false
+            withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                while (true) {
+                    val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                    val c = e.changes.firstOrNull { it.id == first.id }
+                    if (c == null || c.isConsumed || (c.position - first.position).getDistance() > viewConfiguration.touchSlop) { steady = false; break }
+                    if (!c.pressed) { steady = false; tapped = true; break }
+                }
+            }
+            if (!steady) { if (tapped) onTap(); return@awaitEachGesture }
+            context?.let { triggerHaptic(it, HapticStyle.CONFIRM) }
+            sel = current
+            open = true
+            first.consume()
+            val segW = barSize.width / 4f
+            var moved = false
+            while (true) {
+                val e = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                e.changes.forEach { it.consume() }
+                val c = e.changes.firstOrNull { it.id == first.id }
+                if (c == null || !c.pressed) break
+                if (!moved && (c.position - first.position).getDistance() > viewConfiguration.touchSlop) moved = true
+                if (moved) {
+                    val idx = ((c.position.x + overlayLeft) / segW).toInt().coerceIn(0, 3)
+                    if (idx != sel) { sel = idx; context?.let { triggerHaptic(it, HapticStyle.TICK) } }
+                }
+            }
+            // Letting go on the dice always rolls; on any other glyph it switches unless it is already the current list.
+            if (moved && (sel != current || sel == 3)) commit(sel) else open = false
+        }
+    }
+}
+
+@Composable
+fun rememberBarSwitcher(canStart: Boolean, currentIdx: Int, onTap: () -> Unit, onSwitch: (Int, Offset) -> Unit): BarSwitcher {
+    val sw = remember { BarSwitcher() }
+    sw.scope = rememberCoroutineScope()
+    sw.context = LocalContext.current
+    sw.canStart = canStart; sw.current = currentIdx; sw.onTap = onTap; sw.onSwitch = onSwitch
+    return sw
+}
+
+/** The add bar's other face: the lists as glyphs in a row. The highlight follows your thumb; the current list is lit. */
+@Composable
+fun ListSwitcher(icons: List<androidx.compose.ui.graphics.vector.ImageVector>, names: List<String>, current: Int, selected: Int, alpha: Float, modifier: Modifier = Modifier) {
+    val primary = MaterialTheme.colorScheme.primary
+    val lightPage = MaterialTheme.colorScheme.background.luminance() > 0.5f
+    val accent = if (lightPage) MaterialTheme.colorScheme.onBackground else primary
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    BoxWithConstraints(modifier.graphicsLayer { this.alpha = alpha }) {
+        val segW = maxWidth / icons.size
+        val pillX by animateDpAsState(segW * selected, tween(180, easing = FastOutSlowInEasing), label = "switchPill")
+        Box(Modifier.offset(x = pillX).width(segW).fillMaxHeight().padding(5.dp).clip(RoundedCornerShape(16.dp)).background(accent.copy(alpha = 0.16f)))
+        Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+            icons.forEachIndexed { i, icon ->
+                Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
+                    Icon(
+                        icon, contentDescription = names[i], modifier = Modifier.size(24.dp),
+                        tint = if (i == selected) accent else if (i == current) accent.copy(alpha = 0.75f) else muted.copy(alpha = 0.7f)
+                    )
+                }
             }
         }
     }

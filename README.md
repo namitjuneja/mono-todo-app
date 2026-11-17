@@ -33,7 +33,7 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 - **Steps** – show every step, or just the next one.
 - **Stuck menu** – try 2 minutes, break it into steps, or do something else first.
 - **Done** – a wide pill (bigger in landscape); a short win moment, then the next task opens.
-- **Double-tap** – double-tap empty space (including beside the list-button tab) to start focus on the first open task, with the same grow-into-focus animation as tapping it.
+- **Double-tap** – double-tap empty space to start focus on the first open task, with the same grow-into-focus animation as tapping it.
 - **Landscape** – rotate for a flash-card view: the title is centred and large, steps are hidden.
 - **Undo** – floats 10% from the top for 3 seconds after finishing. Leaving focus or moving to another task dismisses it.
 - **Cleaning focus** – no stuck (?) button. Steps can be added in the editor only, not in focus.
@@ -46,10 +46,10 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 
 ### Lists
 - **Main, Morning, Night, Cleaning** – each with its own tasks and colour.
-- **Switch** – tap the sun or moon; tap again, or use the back arrow or the system Back, to return to Main.
+- **Switch** – press and hold the add bar (while it is empty and the keyboard is down) and it turns into the list switcher: four glyphs (checklist = Main, sunrise = Morning, moon = Night, dice = Roll). Slide to one and let go; the bar fades back to normal as the page changes. Letting go on your current list, or without moving, does nothing. A tap on the bar still opens the keyboard. The bar's placeholder names the current list ("Add a task", "Add to Morning", "Add to Night", "Add a tiny clean"). The back arrow or the system Back return to Main.
 - **Light pages** – on the light Day list, task titles use a lighter weight than on the dark lists. Separators there are a slightly darker grey so they stay readable on the pastel page.
-- **Dock** – the list scrolls underneath it, so text shows in the transparent corners beside the tab.
-- **Wash transition** – the new colour spreads from the button.
+- **Add bar** – one plain bar at the bottom (no raised tab), so nothing hides the list beyond that single bar.
+- **Wash transition** – the new colour spreads from the bar.
 - **Daily reset** – Morning and Night uncheck themselves at times you choose.
 - **Fresh start** – killing the app reopens on Main; just minimising it keeps you on the list you were on.
 
@@ -57,7 +57,7 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 - **Roll** – picks one random tiny clean.
 - **Fair** – favours tasks not done lately.
 - **Bank** – tasks are counted, never used up.
-- **Open list** – long-press the dice.
+- **Dice focus screen** – the bottom icons are Back (far left, returns to the list you came from), timer, Done, dice (another one) and Edit (far right, opens the Cleaning list).
 
 ### Archive
 - **Last 7 days** – shown first; older items fold away.
