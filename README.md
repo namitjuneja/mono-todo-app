@@ -11,11 +11,13 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 ### Tasks
 - **Add** – type in the bar, one task per line. The + appears only when there is text.
 - **Complete** – check it off; it stays in place, dimmed.
-- **Steps** – a task's steps show under it in every list, and can be ticked right there.
+- **Steps** – a task's steps show under it in every list. Tap a step's box to tick it; tap anywhere else on it to open the task's editor, just like the task itself.
 - **Reorder** – hold a task anywhere and drag it up or down. There are no drag handles.
 - **Edit** – tap a task for title, notes, steps and timer count. Native copy and paste work. Enter saves and closes.
 - **Focus** – double-tap a task to start focus on it.
-- **Insert between two tasks** – press and hold on the line between two tasks. A thin accent line opens under your finger; let go after a moment for a blank row with the keyboard up (Enter saves it, leaving it empty drops it), or keep holding for about a second: the rows below move down to make room, then an empty separator fades in there (no editor pops up). A quick tap or scroll near a seam is left alone, and pressing on a separator itself still holds to move it.
+- **Insert between two tasks** – press and hold on the gap between two tasks, or in the empty space under the last one. A thin accent line opens, then a blank to-do row appears right there (the keyboard and scroll wait until you lift your finger). Enter saves it. Back, or a tap anywhere else, closes the keyboard and finishes the row in one go: text is kept, an empty row is dropped. Keep holding about two seconds in total and the empty to-do fades away while the rows slide up and a separator fades in. The typed to-do replaces its row in place, no sliding in from the bottom.
+- **Insert next to a separator** – press and hold a separator anywhere: it lifts so you can drag it. Keep holding still for about a second and an empty to-do opens just below it; drag the separator past that row and the new to-do hops above it.
+- **Add bar** – one task per line. Markdown is understood: bullets (`-`, `*`, `+`, `1.`), checklists (`- [ ]`, `- [x]`), and `**bold**`, `~~strike~~` and backticks are stripped. A ticked box or a ~~crossed out~~ item arrives already done.
 - **Archive** – swipe left on a task, or archive the whole list from the top bar (it asks first).
 - **Nothing archives itself.**
 
