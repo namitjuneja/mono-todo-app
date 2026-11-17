@@ -196,6 +196,14 @@ interface TaskDao {
     @Query("UPDATE tasks SET queueOrder = :order WHERE id = :id")
     suspend fun updateOrder(id: Long, order: Long)
 
+    /** Renumbers the list with a hole at [index] and inserts [task] into it, all in one transaction so the list only changes once (no flash at the bottom first). */
+    @Transaction
+    suspend fun insertAtIndex(ids: List<Long>, index: Int, task: TaskEntity): Long {
+        val at = index.coerceIn(0, ids.size)
+        ids.forEachIndexed { i, id -> updateOrder(id, (if (i < at) i + 1 else i + 2) * 10L) }
+        return insert(task.copy(queueOrder = (at + 1) * 10L))
+    }
+
     @Transaction
     suspend fun setOrders(ids: List<Long>) {
         ids.forEachIndexed { i, id -> updateOrder(id, (i + 1) * 10L) }
@@ -439,12 +447,8 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         } else if (lo == null && hi != null) {
             freshTaskId = dao.insert(TaskEntity(title = title, queueOrder = hi - 10L, playlist = _playlist.value))
         } else {
-            val order = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L
-            val newId = dao.insert(TaskEntity(title = title, queueOrder = order, playlist = _playlist.value))
-            freshTaskId = newId
-            val ids = list.map { it.id }.toMutableList()
-            ids.add(index.coerceIn(0, ids.size), newId)
-            dao.setOrders(ids)
+            // No whole number left between the neighbours: renumber and insert in one go.
+            freshTaskId = dao.insertAtIndex(list.map { it.id }, index, TaskEntity(title = title, playlist = _playlist.value))
         }
     }
 
@@ -475,12 +479,7 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
                 val id = dao.insert(TaskEntity(title = "", queueOrder = lo + (hi - lo) / 2, playlist = _playlist.value, isSeparator = true))
                 freshSepId = id
             } else {
-                val order = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L
-                val newId = dao.insert(TaskEntity(title = "", queueOrder = order, playlist = _playlist.value, isSeparator = true))
-                freshSepId = newId
-                val ids = list.map { it.id }.toMutableList()
-                ids.add(if (at >= 0) at + 1 else ids.size, newId)
-                dao.setOrders(ids)
+                freshSepId = dao.insertAtIndex(list.map { it.id }, if (at >= 0) at + 1 else list.size, TaskEntity(title = "", playlist = _playlist.value, isSeparator = true))
             }
         }
     }
@@ -1197,6 +1196,10 @@ fun HomeScreen(
     var input by remember { mutableStateOf("") }
     var quickId by remember { mutableStateOf<Long?>(null) }
     var dockH by remember { mutableStateOf(0.dp) }
+    // The list's bottom room follows the dock (which includes the keyboard). Growing is immediate; shrinking waits a moment and then eases,
+    // so closing the keyboard never yanks a list that was scrolled past its new end (rows used to jump down in two sudden steps).
+    val heldPad = remember { Animatable(dockH, androidx.compose.ui.unit.Dp.VectorConverter) }
+    LaunchedEffect(dockH) { if (dockH >= heldPad.value) heldPad.snapTo(dockH) else { delay(300); heldPad.animateTo(dockH, tween(420, easing = FastOutSlowInEasing)) } }
     var glyphRowCenter by remember { mutableStateOf(Offset.Zero) }
     // When coming back from the focus screen the list starts in the "selected" look and plays the animation in reverse.
     var selectingId by remember { mutableStateOf(returnId) }
@@ -1534,7 +1537,7 @@ fun HomeScreen(
             if (items.isEmpty()) {
                 Text(if (playlist == "cleaning") "Add tiny 2-minute cleans here." else "Nothing to do.", modifier = Modifier.align(Alignment.Center), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { translationY = pull }, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp + dockH)) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { translationY = pull }, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp + heldPad.value)) {
                 // Decided here, in the same pass that builds the list, so the typing row and the real row can never be on screen together for a frame.
                 val takenNow = committedFrom != -1L && committedIds != null && items.any { !it.isSeparator && it.id !in committedIds!! }
                 item(key = "top-slot") {
@@ -1929,7 +1932,8 @@ fun NewTaskRow(onCommit: (String) -> Unit, onCancel: () -> Unit, active: Boolean
     LaunchedEffect(refocus) { if (refocus != null && active) { delay(80); if (!focused && !done) { focus.requestFocus(); keyboard?.show() } } }
     LaunchedEffect(Unit) { appear.animateTo(1f, tween(220)) }
     LaunchedEffect(active) { if (active) { delay(60); focus.requestFocus(); keyboard?.show() } }
-    BackHandler { if (!done) { done = true; onCancel() } }
+    // Back finishes the row: what was typed is kept, an empty row is dropped (it used to throw the text away).
+    BackHandler { finish() }
     // Back closes the keyboard first; that same press should also drop an empty row (or keep what was typed), so watch the keyboard going away.
     val imeInsets = androidx.compose.foundation.layout.WindowInsets.ime
     val rowDensity = LocalDensity.current
