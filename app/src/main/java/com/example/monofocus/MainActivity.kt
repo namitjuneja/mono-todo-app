@@ -1600,10 +1600,17 @@ fun HomeScreen(
                     }
                 )
                 val canAdd = input.isNotBlank()
+                val multiLine = input.contains('\n')   // a separator label has to be a single line
                 val btnShape = RoundedCornerShape(14.dp)
                 // Adds a divider line; anything typed becomes its label.
                 Box(
                     modifier = Modifier.size(40.dp).clip(btnShape).clickable {
+                        if (multiLine) {
+                            // A separator label is one line; say so instead of silently doing something else. Nothing typed is lost.
+                            triggerHaptic(context, HapticStyle.TICK)
+                            android.widget.Toast.makeText(context, "A separator can't have a multi-line label", android.widget.Toast.LENGTH_SHORT).show()
+                            return@clickable
+                        }
                         triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.ADD)
                         val label = input.trim(); input = ""
                         val s = slotId
@@ -1611,7 +1618,7 @@ fun HomeScreen(
                     },
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Outlined.HorizontalRule, contentDescription = "Add a separator", modifier = Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f))
+                    Icon(Icons.Outlined.HorizontalRule, contentDescription = "Add a separator", modifier = Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (multiLine) 0.2f else 0.55f))
                 }
                 // The + only exists while there is something to add.
                 AnimatedVisibility(visible = canAdd, enter = fadeIn(tween(160)) + scaleIn(tween(160), initialScale = 0.7f), exit = fadeOut(tween(120)) + scaleOut(tween(120), targetScale = 0.7f)) {
@@ -1690,7 +1697,7 @@ fun SeparatorRow(
     val scope = rememberCoroutineScope()
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val lightPage = MaterialTheme.colorScheme.background.luminance() > 0.5f
-    val outline = if (lightPage) Color(0xFFD4D4D8) else Color.White.copy(alpha = 0.17f)
+    val outline = if (lightPage) Color(0xFFB4B4BA) else Color.White.copy(alpha = 0.17f)
     val shape = RoundedCornerShape(16.dp)
     // A separator placed by tapping a spot fades in and settles down from just above.
     var appeared by remember(task.id) { mutableStateOf(!fresh) }
@@ -1737,7 +1744,7 @@ fun SeparatorRow(
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (task.title.isNotBlank()) {
-                Text(task.title.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.6.sp, fontWeight = FontWeight.Medium), color = if (lightPage) Color(0xFFAAAAAE) else muted.copy(alpha = 0.45f), modifier = Modifier.widthIn(max = 240.dp))
+                Text(task.title.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.6.sp, fontWeight = FontWeight.Medium), color = if (lightPage) Color(0xFF8A8A90) else muted.copy(alpha = 0.45f), modifier = Modifier.widthIn(max = 240.dp))
                 Spacer(Modifier.width(12.dp))
             }
             Box(Modifier.weight(1f).height(1.dp).background(outline))

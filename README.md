@@ -21,7 +21,7 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 - **Nothing archives itself.**
 
 ### Separators
-- **Add** – the dash button in the add bar; anything typed becomes the label.
+- **Add** – the dash button in the add bar; anything typed becomes the label. A label is one line: once the add bar holds a line break the button greys out, and pressing it says a separator can't have a multi-line label (nothing typed is lost).
 - **Move** – hold it anywhere and drag; it lifts into a card with room above and below.
 - **Rename or remove** – tap it (Enter saves and closes), or swipe left to delete.
 
@@ -47,7 +47,7 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 ### Lists
 - **Main, Morning, Night, Cleaning** – each with its own tasks and colour.
 - **Switch** – tap the sun or moon; tap again, or use the back arrow or the system Back, to return to Main.
-- **Light pages** – on the light Day list, task titles use a lighter weight than on the dark lists.
+- **Light pages** – on the light Day list, task titles use a lighter weight than on the dark lists. Separators there are a slightly darker grey so they stay readable on the pastel page.
 - **Dock** – the list scrolls underneath it, so text shows in the transparent corners beside the tab.
 - **Wash transition** – the new colour spreads from the button.
 - **Daily reset** – Morning and Night uncheck themselves at times you choose.
