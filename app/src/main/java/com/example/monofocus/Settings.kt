@@ -135,6 +135,7 @@ fun SettingsScreen(
     archivedCount: Int, onOpenArchive: () -> Unit,
     morningMin: Int, nightMin: Int, onMorningMin: (Int) -> Unit, onNightMin: (Int) -> Unit,
     autoNext: Boolean, onAutoNext: (Boolean) -> Unit, stopAtSep: Boolean, onStopAtSep: (Boolean) -> Unit,
+    autoKeyboard: Boolean, onAutoKeyboard: (Boolean) -> Unit,
     soundOn: Boolean, onSound: (Boolean) -> Unit, hapticsOn: Boolean, onHaptics: (Boolean) -> Unit,
     eyeLocks: Boolean, onEyeLocks: (Boolean) -> Unit,
     medDefault: Int, onMedDefault: (Int) -> Unit,
@@ -165,6 +166,8 @@ fun SettingsScreen(
             Box(Modifier.alpha(if (autoNext) 1f else 0.4f)) {
                 SettingRow("Stop at separators", "Return to the list at a separator instead of skipping it", onClick = if (autoNext) ({ onStopAtSep(!stopAtSep) }) else null) { QuietCheck(stopAtSep, onStopAtSep, enabled = autoNext) }
             }
+
+            SettingRow("Keyboard on tapped spot", "Open the keyboard when you tap a gap to choose where to add", onClick = { onAutoKeyboard(!autoKeyboard) }) { QuietCheck(autoKeyboard, onAutoKeyboard) }
 
             SectionLabel("Eye")
             SettingRow("Lock the phone", "Off: the eye only keeps the screen on, without locking the phone", onClick = { onEyeLocks(!eyeLocks) }) { QuietCheck(eyeLocks, onEyeLocks) }

@@ -772,6 +772,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
     var hapticsOn by remember { mutableStateOf(uiPrefs.getBoolean("haptics", true).also { Haptics.enabled = it }) }
     var autoNext by remember { mutableStateOf(uiPrefs.getBoolean("auto_next", true)) }
     var stopAtSep by remember { mutableStateOf(uiPrefs.getBoolean("stop_at_separator", true)) }
+    var autoKeyboard by remember { mutableStateOf(uiPrefs.getBoolean("auto_keyboard", true)) }
     var morningMin by remember { mutableIntStateOf(resetMinutes(appContext, "morning")) }
     var nightMin by remember { mutableIntStateOf(resetMinutes(appContext, "night")) }
     var eyeLocks by remember { mutableStateOf(uiPrefs.getBoolean("eye_locks", true)) }
@@ -790,7 +791,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
             val ok = try {
                 val text = viewModel.exportText(linkedMapOf(
                     "morning_reset_minutes" to morningMin.toString(), "night_reset_minutes" to nightMin.toString(),
-                    "auto_next" to autoNext.toString(), "stop_at_separator" to stopAtSep.toString(),
+                    "auto_next" to autoNext.toString(), "stop_at_separator" to stopAtSep.toString(), "auto_keyboard" to autoKeyboard.toString(),
                     "sound" to soundOn.toString(), "haptics" to hapticsOn.toString(), "theme" to (if (isOledDark) "dark" else "light")
                 ))
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { appContext.contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) } }
@@ -804,6 +805,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
         m["night_reset_minutes"]?.toIntOrNull()?.let { nightMin = it; setResetMinutes(appContext, "night", it) }
         m["auto_next"]?.toBooleanStrictOrNull()?.let { autoNext = it; uiPrefs.edit().putBoolean("auto_next", it).apply() }
         m["stop_at_separator"]?.toBooleanStrictOrNull()?.let { stopAtSep = it; uiPrefs.edit().putBoolean("stop_at_separator", it).apply() }
+        m["auto_keyboard"]?.toBooleanStrictOrNull()?.let { autoKeyboard = it; uiPrefs.edit().putBoolean("auto_keyboard", it).apply() }
         m["sound"]?.toBooleanStrictOrNull()?.let { soundOn = it; Sfx.enabled = it; uiPrefs.edit().putBoolean("sounds", it).apply() }
         m["haptics"]?.toBooleanStrictOrNull()?.let { hapticsOn = it; Haptics.enabled = it; uiPrefs.edit().putBoolean("haptics", it).apply() }
         m["theme"]?.let { if ((it == "dark") != isOledDark) onToggleTheme() }
@@ -1028,6 +1030,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
         ) { target ->
             when (target) {
                 ScreenState.HOME -> HomeScreen(
+                    autoKeyboard = autoKeyboard,
                     tasks = todayList, subtasksByTask = subtasksByTask, editor = editor,
                     onAddTasks = { viewModel.addTasks(it, "") },
                     onComplete = viewModel::completeTask, onUndoComplete = viewModel::undoCompleteTask, onArchiveTask = viewModel::archiveTask,
@@ -1086,6 +1089,7 @@ fun MonoFocusApp(viewModel: TaskViewModel, isOledDark: Boolean, onToggleTheme: (
                     onNightMin = { nightMin = it; setResetMinutes(appContext, "night", it) },
                     autoNext = autoNext, onAutoNext = { autoNext = it; uiPrefs.edit().putBoolean("auto_next", it).apply() },
                     stopAtSep = stopAtSep, onStopAtSep = { stopAtSep = it; uiPrefs.edit().putBoolean("stop_at_separator", it).apply() },
+                    autoKeyboard = autoKeyboard, onAutoKeyboard = { autoKeyboard = it; uiPrefs.edit().putBoolean("auto_keyboard", it).apply() },
                     soundOn = soundOn, onSound = { soundOn = it; Sfx.enabled = it; uiPrefs.edit().putBoolean("sounds", it).apply(); if (it) Sfx.play(Sound.TICK) },
                     hapticsOn = hapticsOn, onHaptics = { hapticsOn = it; Haptics.enabled = it; uiPrefs.edit().putBoolean("haptics", it).apply(); if (it) triggerHaptic(appContext, HapticStyle.TICK) },
                     eyeLocks = eyeLocks, onEyeLocks = { eyeLocks = it; uiPrefs.edit().putBoolean("eye_locks", it).apply() },
@@ -1203,7 +1207,7 @@ fun HomeScreen(
     undoBanner: TaskViewModel.UndoBanner? = null, onUndo: () -> Unit = {}, onDismissUndo: () -> Unit = {},
     playlist: String, onPlaylist: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit,
     autoSelectId: Long?, returnId: Long?, returnY: Float, onReturnConsumed: () -> Unit,
-    keepScreenOn: Boolean = false, onToggleKeepScreenOn: () -> Unit = {}
+    keepScreenOn: Boolean = false, onToggleKeepScreenOn: () -> Unit = {}, autoKeyboard: Boolean = true
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -1275,13 +1279,61 @@ fun HomeScreen(
     // TOP_SEAM = above the first row; otherwise "right after the row with this id". It lets go by itself after a while without use.
     var slotId by remember { mutableStateOf<Long?>(null) }
     var slotTick by remember { mutableIntStateOf(0) }
-    LaunchedEffect(slotId, slotTick) { if (slotId != null) { delay(12_000); slotId = null } }
+    // Once what was typed is in (or the spot is let go), the chosen spot clears and the keyboard tucks away.
+    val keyboardCtl = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    val barFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val autoKeyboardNow by rememberUpdatedState(autoKeyboard)
+    fun finishPlacing() { slotId = null; keyboardCtl?.hide(); focusManager.clearFocus() }
+    // After pressing add, things happen one after another instead of all at once: the new rows appear and settle (the marker fades and
+    // the list does not move), then the keyboard closes, then the list glides back to where it was.
+    var committing by remember { mutableStateOf(false) }
+    val settleJob = remember { arrayOfNulls<kotlinx.coroutines.Job>(1) }
+    fun settleThenFinish(rows: Int) {
+        settleJob[0]?.cancel()
+        settleJob[0] = scope.launch { delay(340L + 70L * (rows - 1).coerceAtLeast(0)); committing = false; finishPlacing() }
+    }
+    LaunchedEffect(slotId, slotTick) { if (slotId != null) { delay(12_000); finishPlacing() } }
     LaunchedEffect(input) { if (slotId != null) slotTick++ }   // typing keeps the spot alive
     LaunchedEffect(playlist, selectingId) { slotId = null }
     LaunchedEffect(items.size) { delay(400); val s = slotId; if (s != null && s != TOP_SEAM && items.none { it.id == s }) slotId = null }
-    // Once what was typed is in, the chosen spot lets go and the keyboard tucks away.
-    val keyboardCtl = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
-    fun finishPlacing() { slotId = null; keyboardCtl?.hide(); focusManager.clearFocus() }
+
+    // While the keyboard is up the list is nudged just enough to keep the marked line in view, and nudged back the moment the keyboard
+    // goes away or the spot is let go. Both moves are one smooth glide; if you scroll yourself the list stays where you put it.
+    var imeUp by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { snapshotFlow { imeInsets.getBottom(density) > 0 }.collect { imeUp = it } }
+    var adjustPx by remember { mutableFloatStateOf(0f) }   // how far we have scrolled the list for the line
+    LaunchedEffect(Unit) { snapshotFlow { listState.isScrollInProgress }.collect { if (it) adjustPx = 0f } }
+    suspend fun glide(delta: Float) {
+        var last = 0f
+        animate(0f, delta, animationSpec = tween(320, easing = FastOutSlowInEasing)) { v, _ -> adjustPx += listState.dispatchRawDelta(v - last); last = v }
+    }
+    // Restoring is keyed on "should the list be back where it was" (spot let go, or keyboard gone), so it never restarts mid-glide.
+    val restoreNow = slotId == null || !imeUp
+    LaunchedEffect(slotId, restoreNow) {
+        val s = slotId
+        if (restoreNow) {
+            if (adjustPx != 0f) {
+                // Let the keyboard finish going down first, then glide the list back.
+                var k = 0
+                while (imeInsets.getBottom(density) > 0 && k < 25) { delay(40); k++ }
+                delay(40)
+                val back = adjustPx
+                if (back != 0f) glide(-back)
+            }
+            return@LaunchedEffect
+        }
+        if (committing || s == null) return@LaunchedEffect   // rows are arriving: the list stays put
+        // Wait for the keyboard to finish rising, then bring the line into view only if it is hidden or too close to the dock.
+        var prev = -1
+        for (k in 0 until 25) { val b = imeInsets.getBottom(density); if (b > 0 && b == prev) break; prev = b; delay(60) }
+        delay(60)
+        val info = listState.layoutInfo
+        val key: Any = if (s == TOP_SEAM) "top-slot" else s
+        val item = info.visibleItemsInfo.firstOrNull { it.key == key } ?: return@LaunchedEffect
+        val lineY = item.offset + item.size - with(density) { 7.dp.toPx() } + info.beforeContentPadding
+        val bottomEdge = info.viewportSize.height - with(density) { dockH.toPx() }
+        if (lineY > bottomEdge - with(density) { 96.dp.toPx() } || lineY < with(density) { 24.dp.toPx() }) glide(lineY - bottomEdge * 0.4f)
+    }
     val seamTol = remember(density) { with(density) { 12.dp.toPx() } }
     val gapHalf = remember(density) { with(density) { 7.dp.toPx() } }
     fun it_seam(i: androidx.compose.foundation.lazy.LazyListItemInfo, marked: Long?, half: Float): Float = i.offset + i.size - (if (i.key == marked) half else 0f)
@@ -1319,8 +1371,11 @@ fun HomeScreen(
             val lift = up ?: return@awaitEachGesture
             if (onRow) lift.consume()   // the edge of a row is not a tap on that row
             triggerHaptic(context, HapticStyle.TICK)
-            // Tapping the marked spot again lets it go.
-            if (slotId == seam) slotId = null else { slotId = seam; slotTick++ }
+            // Tapping the marked spot again lets it go (and closes the keyboard).
+            if (slotId == seam) finishPlacing() else {
+                slotId = seam; slotTick++
+                if (autoKeyboardNow) { barFocus.requestFocus(); keyboardCtl?.show() }
+            }
         }
     }
 
@@ -1382,9 +1437,13 @@ fun HomeScreen(
             triggerHaptic(context, HapticStyle.TICK)
             Sfx.play(Sound.ADD)
             val s = slotId
-            if (s != null) onInsertAt(s, input) {} else onAddTasks(input)
+            val rows = input.lines().count { it.isNotBlank() }.coerceAtLeast(1)
+            if (s != null) {
+                committing = true   // the marker fades, the list holds still
+                scope.launch { delay(1500); if (committing) { committing = false; finishPlacing() } }   // safety: never stay stuck if nothing was added
+                onInsertAt(s, input) { last -> slotId = last; settleThenFinish(rows) }   // later adds in the meantime land after these
+            } else { onAddTasks(input); settleThenFinish(rows) }
             input = ""
-            if (s != null) finishPlacing()
         }
     }
 
@@ -1451,7 +1510,7 @@ fun HomeScreen(
                     val first = items.firstOrNull()
                     Column(Modifier.fillMaxWidth()) {
                         Spacer(Modifier.fillMaxWidth().height(animateDpAsState(if (first != null && !first.isSeparator) 24.dp else 0.dp, tween(200), label = "slotH").value))
-                        SlotLine(slotId == TOP_SEAM)
+                        SlotLine(slotId == TOP_SEAM && !committing)
                     }
                 }
                 items(items, key = { it.id }) { task ->
@@ -1535,7 +1594,7 @@ fun HomeScreen(
                         onToggleSub = editor.onToggleSub,
                         onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
                     )
-                    SlotLine(slotId == task.id)
+                    SlotLine(slotId == task.id && !committing)
                 }
             }
         }
@@ -1587,7 +1646,7 @@ fun HomeScreen(
             ) {
                 BasicTextField(
                     value = input, onValueChange = { input = it },
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(1f).focusRequester(barFocus),
                     textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
                     cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                     maxLines = 4,
@@ -1614,7 +1673,10 @@ fun HomeScreen(
                         triggerHaptic(context, HapticStyle.TICK); Sfx.play(Sound.ADD)
                         val label = input.trim(); input = ""
                         val s = slotId
-                        if (s != null) { onInsertSeparatorAt(s, label) {}; finishPlacing() } else onAddSeparator(label)
+                        if (s != null) {
+                            committing = true
+                            onInsertSeparatorAt(s, label) { last -> slotId = last; settleThenFinish(1) }
+                        } else { onAddSeparator(label); settleThenFinish(1) }
                     },
                     contentAlignment = Alignment.Center
                 ) {
