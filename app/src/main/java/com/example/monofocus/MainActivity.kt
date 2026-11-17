@@ -434,16 +434,13 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         val list = todayList.value
         val lo = list.getOrNull(index - 1)?.queueOrder
         val hi = list.getOrNull(index)?.queueOrder
-        Dbg.d("VM insertTaskAt index=$index lo=$lo hi=$hi listSize=${list.size}")
         if (lo != null && hi != null && hi - lo > 1) {
             freshTaskId = dao.insert(TaskEntity(title = title, queueOrder = lo + (hi - lo) / 2, playlist = _playlist.value))
         } else if (lo == null && hi != null) {
             freshTaskId = dao.insert(TaskEntity(title = title, queueOrder = hi - 10L, playlist = _playlist.value))
-            Dbg.d("VM insert returned id=$freshTaskId (branch top)")
         } else {
             val order = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L
             val newId = dao.insert(TaskEntity(title = title, queueOrder = order, playlist = _playlist.value))
-            Dbg.d("VM insert returned id=$newId at BOTTOM order=$order (branch fallback, reorder follows)")
             freshTaskId = newId
             val ids = list.map { it.id }.toMutableList()
             ids.add(index.coerceIn(0, ids.size), newId)
@@ -571,18 +568,6 @@ enum class HapticStyle { TICK, CONFIRM, SHATTER }
 
 /** Master switch for vibration, set from Settings. */
 object Haptics { var enabled = true }
-
-/** TEMPORARY debug trace: logcat tag MonoDbg, also appended to <app external files>/monodbg.txt. */
-object Dbg {
-    var file: java.io.File? = null
-    private val io = java.util.concurrent.Executors.newSingleThreadExecutor()
-    fun d(m: String) {
-        val line = "${android.os.SystemClock.uptimeMillis()} $m"
-        android.util.Log.d("MonoDbg", line)
-        val f = file ?: return
-        io.execute { try { f.appendText(line + "\n") } catch (_: Exception) {} }   // off the main thread so logging never disturbs the animation timing
-    }
-}
 
 fun triggerHaptic(context: Context, style: HapticStyle) {
     if (!Haptics.enabled) return
@@ -1231,7 +1216,7 @@ fun HomeScreen(
     var draggingId by remember { mutableStateOf<Long?>(null) }
     var dragDelta by remember { mutableFloatStateOf(0f) }
     var dragStartOffset by remember { mutableIntStateOf(0) }
-    LaunchedEffect(tasks) { Dbg.d("UI tasks emitted size=${tasks.size} first=${tasks.take(3).map { it.id }} dragging=$draggingId"); if (draggingId == null) { items.clear(); items.addAll(tasks) } }
+    LaunchedEffect(tasks) { if (draggingId == null) { items.clear(); items.addAll(tasks) } }
     // After finishing a task the next one is opened automatically; make sure its row is on screen first.
     // The row is brought to the middle of the visible area (above the dock) first; only then does it start growing into focus.
     var readyId by remember { mutableStateOf<Long?>(null) }
@@ -1276,16 +1261,11 @@ fun HomeScreen(
     var gapBefore by remember { mutableStateOf(false) }
     // While a finger is still holding, the new row is only shown; focus, keyboard and scrolling wait for the release.
     var gapActive by remember { mutableStateOf(true) }
-    val dbgCtx = LocalContext.current
-    LaunchedEffect(Unit) {
-        try { val f = java.io.File(dbgCtx.getExternalFilesDir(null), "monodbg.txt"); if (f.length() > 300_000) f.delete(); Dbg.file = f } catch (_: Exception) {}
-        Dbg.d("---- session start")
-    }
-    LaunchedEffect(Unit) { snapshotFlow { listState.layoutInfo.visibleItemsInfo.take(4).map { "${it.key}@${it.offset}+${it.size}" } }.collect { Dbg.d("LAYOUT $it scroll=${listState.firstVisibleItemIndex}/${listState.firstVisibleItemScrollOffset}") } }
-    LaunchedEffect(Unit) { snapshotFlow { imeInsets.getBottom(density) }.collect { Dbg.d("IME bottom=$it") } }
     var committedFrom by remember { mutableStateOf<Long?>(-1L) }   // -1 = nothing committed; otherwise the fresh-task id before the commit
-    val rowTakenOver = committedFrom != -1L && freshTaskId != committedFrom && freshTaskId != null && items.any { it.id == freshTaskId }
-    LaunchedEffect(rowTakenOver) { Dbg.d("UI rowTakenOver=$rowTakenOver gapAfterId=$gapAfterId freshTaskId=$freshTaskId items=${items.take(3).map { it.id }}"); if (rowTakenOver) { gapAfterId = null; gapBefore = false; committedFrom = -1L } }   // the new row sits above its separator (the separator was dragged below it)
+    // The ids present at the moment of commit: the typed task is whichever new to-do shows up after that (no waiting for freshTaskId, which is set a moment apart from the list update).
+    var committedIds by remember { mutableStateOf<Set<Long>?>(null) }
+    val rowTakenOver = committedFrom != -1L && committedIds != null && items.any { !it.isSeparator && it.id !in committedIds!! }
+    LaunchedEffect(rowTakenOver) { if (rowTakenOver) { gapAfterId = null; gapBefore = false; committedFrom = -1L; committedIds = null } }   // the new row sits above its separator (the separator was dragged below it)
     val newRowPx = remember(density) { with(density) { 54.dp.toPx() } }
     var spreadAfterId by remember { mutableStateOf<Long?>(null) }
     var spreadAmount by remember { mutableFloatStateOf(0f) }
@@ -1555,6 +1535,8 @@ fun HomeScreen(
                 Text(if (playlist == "cleaning") "Add tiny 2-minute cleans here." else "Nothing to do.", modifier = Modifier.align(Alignment.Center), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { translationY = pull }, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp + dockH)) {
+                // Decided here, in the same pass that builds the list, so the typing row and the real row can never be on screen together for a frame.
+                val takenNow = committedFrom != -1L && committedIds != null && items.any { !it.isSeparator && it.id !in committedIds!! }
                 item(key = "top-slot") {
                     val first = items.firstOrNull()
                     val convertingTop = convertAfterId == TOP_SEAM
@@ -1562,13 +1544,13 @@ fun HomeScreen(
                     Column(Modifier.fillMaxWidth()) {
                         Spacer(Modifier.fillMaxWidth().height(animateDpAsState(slotH.dp, tween(200), label = "slotH").value))
                         if (spreadAfterId == TOP_SEAM) Box(Modifier.fillMaxWidth().height(2.dp + 49.dp * spreadAmount)) { Box(Modifier.fillMaxWidth().height(1.5.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))) }
-                        if (gapAfterId == TOP_SEAM && !rowTakenOver) NewTaskRow(onCommit = { committedFrom = freshTaskNow; onInsertAfter(TOP_SEAM, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
+                        if (gapAfterId == TOP_SEAM && !takenNow) NewTaskRow(onCommit = { committedFrom = freshTaskNow; committedIds = items.map { it.id }.toSet(); onInsertAfter(TOP_SEAM, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
                         if (convertingTop) ConvertGap(convertP.value, sepTakenOver)
                     }
                 }
                 items(items, key = { it.id }) { task ->
                     // Once a typed-in task exists in the list, its real row takes the place of the typing row in the same frame (no gap, no sliding).
-                    val takenOver = rowTakenOver
+                    val takenOver = takenNow
                     val isDragging = draggingId == task.id
                     val rowModifier = if (isDragging || selectingId == task.id) Modifier.zIndex(1f) else Modifier.animateItemPlacement()
                     val dragTranslation = {
@@ -1647,7 +1629,7 @@ fun HomeScreen(
                             }
                             Box(Modifier.graphicsLayer { translationY = glide.value }) {
                             NewTaskRow(
-                                onCommit = { committedFrom = freshTaskNow; if (gapBefore) onInsertBefore(task.id, it) else onInsertAfter(task.id, it) },
+                                onCommit = { committedFrom = freshTaskNow; committedIds = items.map { it.id }.toSet(); if (gapBefore) onInsertBefore(task.id, it) else onInsertAfter(task.id, it) },
                                 onCancel = { gapAfterId = null; gapBefore = false },
                                 active = gapActive,
                                 refocus = gapBefore,
@@ -1692,7 +1674,7 @@ fun HomeScreen(
                     )
                     if (spreadAfterId == task.id) Box(Modifier.fillMaxWidth().height(2.dp + 49.dp * spreadAmount)) { Box(Modifier.fillMaxWidth().height(1.5.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))) }
                     if (convertAfterId == task.id && !task.isSeparator) ConvertGap(convertP.value, sepTakenOver)
-                    if (gapAfterId == task.id && !task.isSeparator && !takenOver) NewTaskRow(onCommit = { committedFrom = freshTaskNow; onInsertAfter(task.id, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
+                    if (gapAfterId == task.id && !task.isSeparator && !takenOver) NewTaskRow(onCommit = { committedFrom = freshTaskNow; committedIds = items.map { it.id }.toSet(); onInsertAfter(task.id, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
                 }
             }
         }
@@ -1935,9 +1917,9 @@ fun NewTaskRow(onCommit: (String) -> Unit, onCancel: () -> Unit, active: Boolean
     var done by remember { mutableStateOf(false) }
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val appear = remember { Animatable(0f) }
-    val finish = { Dbg.d("ROW finish text='$v' done=$done"); if (!done) { done = true; val t = v.trim(); if (t.isEmpty()) onCancel() else onCommit(t) } }
+    val finish = { if (!done) { done = true; val t = v.trim(); if (t.isEmpty()) onCancel() else onCommit(t) } }
     // Moving the row (or removing it from outside) is not the user finishing it, so a focus loss during disposal must not cancel anything.
-    DisposableEffect(Unit) { Dbg.d("ROW composed"); onDispose { Dbg.d("ROW disposed"); done = true; onPlaced(null) } }
+    DisposableEffect(Unit) { onDispose { done = true; onPlaced(null) } }
     // Losing focus finishes the row, but only if it stays lost: being moved above/below its separator drops focus for a moment, then we take it back.
     LaunchedEffect(lostFocusAt) {
         if (lostFocusAt == 0L) return@LaunchedEffect
