@@ -1256,8 +1256,11 @@ fun HomeScreen(
     // While a finger is still holding, the new row is only shown; focus, keyboard and scrolling wait for the release.
     var gapActive by remember { mutableStateOf(true) }
     var committedFrom by remember { mutableStateOf<Long?>(-1L) }   // -1 = nothing committed; otherwise the fresh-task id before the commit
-    val rowTakenOver = committedFrom != -1L && freshTaskId != committedFrom && freshTaskId != null && items.any { it.id == freshTaskId }
-    LaunchedEffect(rowTakenOver) { if (rowTakenOver) { gapAfterId = null; gapBefore = false; committedFrom = -1L } }   // the new row sits above its separator (the separator was dragged below it)
+    // The ids present at the moment of commit. The typed task is whichever new to-do shows up after that: the list can emit it before the insert call returns (and freshTaskId is set),
+    // and waiting for freshTaskId would leave the typing row up for a frame or two, then yank it away so the real row slides in from below.
+    var committedIds by remember { mutableStateOf<Set<Long>?>(null) }
+    val rowTakenOver = committedFrom != -1L && committedIds != null && items.any { !it.isSeparator && it.id !in committedIds!! }
+    LaunchedEffect(rowTakenOver) { if (rowTakenOver) { gapAfterId = null; gapBefore = false; committedFrom = -1L; committedIds = null } }   // the new row sits above its separator (the separator was dragged below it)
     val newRowPx = remember(density) { with(density) { 54.dp.toPx() } }
     var spreadAfterId by remember { mutableStateOf<Long?>(null) }
     var spreadAmount by remember { mutableFloatStateOf(0f) }
@@ -1534,7 +1537,7 @@ fun HomeScreen(
                     Column(Modifier.fillMaxWidth()) {
                         Spacer(Modifier.fillMaxWidth().height(animateDpAsState(slotH.dp, tween(200), label = "slotH").value))
                         if (spreadAfterId == TOP_SEAM) Box(Modifier.fillMaxWidth().height(2.dp + 49.dp * spreadAmount)) { Box(Modifier.fillMaxWidth().height(1.5.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))) }
-                        if (gapAfterId == TOP_SEAM && !rowTakenOver) NewTaskRow(onCommit = { committedFrom = freshTaskNow; onInsertAfter(TOP_SEAM, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
+                        if (gapAfterId == TOP_SEAM && !rowTakenOver) NewTaskRow(onCommit = { committedFrom = freshTaskNow; committedIds = items.map { it.id }.toSet(); onInsertAfter(TOP_SEAM, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
                         if (convertingTop) ConvertGap(convertP.value, sepTakenOver)
                     }
                 }
@@ -1619,7 +1622,7 @@ fun HomeScreen(
                             }
                             Box(Modifier.graphicsLayer { translationY = glide.value }) {
                             NewTaskRow(
-                                onCommit = { committedFrom = freshTaskNow; if (gapBefore) onInsertBefore(task.id, it) else onInsertAfter(task.id, it) },
+                                onCommit = { committedFrom = freshTaskNow; committedIds = items.map { it.id }.toSet(); if (gapBefore) onInsertBefore(task.id, it) else onInsertAfter(task.id, it) },
                                 onCancel = { gapAfterId = null; gapBefore = false },
                                 active = gapActive,
                                 refocus = gapBefore,
@@ -1664,7 +1667,7 @@ fun HomeScreen(
                     )
                     if (spreadAfterId == task.id) Box(Modifier.fillMaxWidth().height(2.dp + 49.dp * spreadAmount)) { Box(Modifier.fillMaxWidth().height(1.5.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))) }
                     if (convertAfterId == task.id && !task.isSeparator) ConvertGap(convertP.value, sepTakenOver)
-                    if (gapAfterId == task.id && !task.isSeparator && !takenOver) NewTaskRow(onCommit = { committedFrom = freshTaskNow; onInsertAfter(task.id, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
+                    if (gapAfterId == task.id && !task.isSeparator && !takenOver) NewTaskRow(onCommit = { committedFrom = freshTaskNow; committedIds = items.map { it.id }.toSet(); onInsertAfter(task.id, it) }, onCancel = { gapAfterId = null }, active = gapActive, onPlaced = { newRowBounds = it })
                 }
             }
         }
