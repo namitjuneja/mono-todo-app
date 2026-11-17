@@ -146,6 +146,7 @@ fun SettingsScreen(
     BackHandler(onBack = onBack)
     val context = LocalContext.current
     var editing by remember { mutableStateOf<String?>(null) }
+    var showFormats by remember { mutableStateOf(false) }
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
 
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
@@ -199,8 +200,15 @@ fun SettingsScreen(
             SectionLabel("Data")
             SettingRow("Export backup", "Save lists, steps and settings to a text file", onClick = onExport)
             SettingRow("Import backup", "Add to the end of your lists, or overwrite them", onClick = onImport)
+
+            SectionLabel("Shortcuts")
+            SettingRow("Time formats", "What you can type for to-do estimates and separator times", onClick = { showFormats = true }) {
+                Icon(Icons.AutoMirrored.Outlined.KeyboardArrowRight, contentDescription = null, tint = muted.copy(alpha = 0.7f))
+            }
         }
     }
+
+    if (showFormats) TimeFormatsSheet(onClose = { showFormats = false })
 
     editing?.let { which ->
         TimeDialog(
@@ -209,5 +217,77 @@ fun SettingsScreen(
             onDone = { m -> when (which) { "morning" -> onMorningMin(m); "sleep" -> onSleepMin(m); else -> onNightMin(m) }; editing = null },
             onDismiss = { editing = null }
         )
+    }
+}
+
+/** One line of the reference: what you type, and what you get. */
+@Composable
+private fun FormatRow(typed: String, result: String) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(typed, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium), color = MaterialTheme.colorScheme.onSurface)
+        Text(result, style = MaterialTheme.typography.bodyMedium.copy(fontFeatureSettings = "tnum"), color = MaterialTheme.colorScheme.primary)
+    }
+}
+
+@Composable
+private fun FormatGroup(label: String) {
+    Text(label, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f), modifier = Modifier.padding(top = 14.dp, bottom = 2.dp))
+}
+
+@Composable
+private fun FormatNote(text: String) {
+    Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f), modifier = Modifier.padding(top = 8.dp))
+}
+
+/** A quick reference of the times the add bar understands. Open it from Settings > Shortcuts. */
+@Composable
+private fun TimeFormatsSheet(onClose: () -> Unit) {
+    val line = Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.colorScheme.outline)
+    InWindowSheet(onDismiss = onClose) {
+        Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()).navigationBarsPadding().padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
+            Text("Time formats", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold), color = MaterialTheme.colorScheme.onSurface)
+            Text("Type them in the add bar, one item per line.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp))
+
+            SectionLabel("To-dos")
+            Text("Put the estimate at the end of the line.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            FormatGroup("Minutes")
+            FormatRow("Call the bank 15 mins", "15 mins")
+            FormatRow("Call the bank 15min", "15 mins")
+            FormatRow("Call the bank 15m", "15 mins")
+            FormatRow("Call the bank 20 minutes", "20 mins")
+            FormatGroup("Hours")
+            FormatRow("Write report 1 hr", "1 hr")
+            FormatRow("Write report 2h", "2 hrs")
+            FormatRow("Write report 1.5 hours", "1.5 hrs")
+            FormatGroup("Both")
+            FormatRow("Gym 1h30m", "1h 30mins")
+            FormatRow("Gym 1 hr 30 mins", "1h 30mins")
+            FormatGroup("Also fine around it")
+            FormatRow("Email - 20 min", "20 mins")
+            FormatRow("Email (20 min)", "20 mins")
+            FormatRow("Email | 20 min", "20 mins")
+            FormatNote("A unit is required, so \"Read chapter 3\" stays as it is. A one-letter unit must touch the number: 15m works, 15 m does not.")
+
+            Spacer(Modifier.height(18.dp)); Box(line)
+
+            SectionLabel("Separators")
+            Text("Tap the separator button after typing. A time at the end becomes the separator's time.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            FormatGroup("12 hour")
+            FormatRow("7pm   7 pm   7p", "7 pm")
+            FormatRow("7am   7a", "7 am")
+            FormatRow("7:30 pm   7:30p   7:30 p.m.", "7:30 pm")
+            FormatRow("730p   1130a", "7:30 pm   11:30 am")
+            FormatGroup("24 hour")
+            FormatRow("19:00", "19:00")
+            FormatRow("19h   19h30", "19h30")
+            FormatGroup("With a title")
+            FormatRow("Lunch 12:30", "Lunch · 12:30")
+            FormatRow("Lunch at 7pm", "Lunch · 7 pm")
+            FormatRow("Lunch - 7:30 pm", "Lunch · 7:30 pm")
+            FormatGroup("Only a time")
+            FormatRow("7pm", "no line, just 7 pm")
+            FormatNote("A bare number is not a time, so \"Section 7\" stays a title.")
+            FormatNote("In the separator editor, am or pm lights up by itself to match your clock when you start typing. A time of 13 or more switches it off. Tap :00, :15, :30 or :45 to set the minutes; a new one replaces the old.")
+        }
     }
 }

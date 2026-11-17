@@ -136,7 +136,9 @@ data class TaskEntity(
     val doneCount: Int = 0,
     val lastPickedAt: Long = 0L,
     val isSeparator: Boolean = false,
-    val archivedAt: Long = 0L
+    val archivedAt: Long = 0L,
+    /** Free-text time estimate for a to-do, or the time shown on a separator ("30 mins", "9:30"). */
+    val duration: String = ""
 )
 
 @Entity(tableName = "subtasks")
@@ -162,8 +164,8 @@ interface TaskDao {
     @Delete
     suspend fun deleteSubtask(subtask: SubtaskEntity)
 
-    @Query("UPDATE tasks SET title = :title, notes = :notes WHERE id = :id")
-    suspend fun updateText(id: Long, title: String, notes: String)
+    @Query("UPDATE tasks SET title = :title, notes = :notes, duration = :duration WHERE id = :id")
+    suspend fun updateText(id: Long, title: String, notes: String, duration: String)
 
     @Query("SELECT * FROM tasks WHERE playlist = :playlist AND archivedFromList = 0 ORDER BY queueOrder ASC")
     fun getTodayList(playlist: String): kotlinx.coroutines.flow.Flow<List<TaskEntity>>
@@ -183,8 +185,8 @@ interface TaskDao {
     @Query("UPDATE tasks SET isCompleted = 0, completedAt = NULL WHERE playlist = :playlist AND isCompleted = 1 AND archivedFromList = 0")
     suspend fun uncheckAll(playlist: String)
 
-    @Query("UPDATE tasks SET title = :label WHERE id = :id")
-    suspend fun setLabel(id: Long, label: String)
+    @Query("UPDATE tasks SET title = :label, duration = :duration WHERE id = :id")
+    suspend fun setLabel(id: Long, label: String, duration: String)
 
     @Query("SELECT * FROM tasks WHERE id = :id")
     fun observeTask(id: Long): kotlinx.coroutines.flow.Flow<TaskEntity?>
@@ -279,7 +281,7 @@ interface TaskDao {
     suspend fun deleteAllSubtasks()
 }
 
-@Database(entities = [TaskEntity::class, SubtaskEntity::class], version = 7, exportSchema = false)
+@Database(entities = [TaskEntity::class, SubtaskEntity::class], version = 8, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun taskDao(): TaskDao
 
@@ -320,6 +322,10 @@ abstract class AppDatabase : RoomDatabase() {
                         db.execSQL("ALTER TABLE tasks ADD COLUMN archivedAt INTEGER NOT NULL DEFAULT 0")
                         db.execSQL("UPDATE tasks SET archivedAt = COALESCE(completedAt, ${System.currentTimeMillis()}) WHERE archivedFromList = 1")
                     }
+                }, object : androidx.room.migration.Migration(7, 8) {
+                    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                        db.execSQL("ALTER TABLE tasks ADD COLUMN duration TEXT NOT NULL DEFAULT ''")
+                    }
                 }).build().also { INSTANCE = it }
             }
         }
@@ -334,14 +340,76 @@ private val MD_RULE = Regex("""^\s*([-*_])(\s*\1){2,}\s*$""")
  * Turns pasted text into tasks, one per line. Markdown is understood: bullets (- * + and 1.), checklists (- [ ] / - [x]) and **bold**,
  * ~~strikethrough~~ and `code` markers are stripped. A ticked box or a ~~crossed out~~ item comes back as already done.
  */
-fun parseTaskLines(raw: String): List<Pair<String, Boolean>> = raw.lines().mapNotNull { line ->
+fun parseTaskLines(raw: String): List<ParsedLine> = raw.lines().mapNotNull { line ->
     if (line.isBlank() || MD_RULE.matches(line)) return@mapNotNull null
     val m = MD_ITEM.matchEntire(line.trimEnd()) ?: return@mapNotNull null
     var done = m.groupValues[1].equals("x", ignoreCase = true)
     var text = m.groupValues[2].trim()
     if (Regex("""~~.+~~""").containsMatchIn(text)) done = true
     text = text.replace("~~", "").replace("**", "").replace("`", "").trim()
-    if (text.isEmpty()) null else text to done
+    if (text.isEmpty()) return@mapNotNull null
+    // "Call the bank 15 mins" -> title "Call the bank", time "15 mins". Never leaves the title empty.
+    val split = splitTrailingDuration(text)
+    ParsedLine(split?.first ?: text, done, split?.second ?: "")
+}
+
+data class ParsedLine(val title: String, val done: Boolean, val duration: String)
+
+private const val DELIMS = """[\s\-–—|·@,:(]+"""
+private val DURATION_TAIL = Regex(
+    """^(.*?)$DELIMS\(?(?:(\d+(?:[.,]\d+)?)(?:\s*(?:hours?|hrs?)|h)(?:\s*(\d+)(?:\s*(?:minutes?|mins?)|m))?|(\d+)(?:\s*(?:minutes?|mins?)|m))\)?\s*$""",
+    RegexOption.IGNORE_CASE
+)
+private fun num(d: Double) = if (d % 1.0 == 0.0) d.toLong().toString() else d.toString()
+
+/**
+ * Splits a trailing time estimate off a to-do line: "15 mins", "15min", "15m", "20 minutes", "1 hr", "2h", "1.5 hours", "1h30m", "1 hr 30 mins".
+ * The unit is required (a bare number is just part of the title); a one-letter unit has to touch the number ("15m", not "15 m").
+ * Hours plus minutes keep both parts ("1h30m" -> "1h 30mins"). Returns null when there is no time or it would leave no title.
+ */
+fun splitTrailingDuration(text: String): Pair<String, String>? {
+    val m = DURATION_TAIL.matchEntire(text.trim()) ?: return null
+    val title = m.groupValues[1].trim().trimEnd('-', '–', '—', '|', '·', '@', ',', ':', '(', ' ')
+    if (title.isEmpty()) return null
+    val hours = m.groupValues[2].replace(',', '.').toDoubleOrNull()
+    val minsAfterHours = m.groupValues[3].toDoubleOrNull()
+    val mins = m.groupValues[4].toDoubleOrNull()
+    val dur = when {
+        hours != null && minsAfterHours != null -> "${num(hours)}h ${num(minsAfterHours)}${if (minsAfterHours == 1.0) "min" else "mins"}"
+        hours != null -> "${num(hours)} hrs"
+        mins != null -> "${num(mins)} mins"
+        else -> return null
+    }
+    return title to dur
+}
+
+private const val CLOCK = """(?:(?:1[0-2]|0?[1-9])[0-5]\d\s*[ap]\.?(?:m\.?)?|(?:1[0-2]|0?[1-9])(?::[0-5]\d)?\s*[ap]\.?(?:m\.?)?|(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*[ap]\.?(?:m\.?)?)?|(?:[01]?\d|2[0-3])h(?:[0-5]\d)?)"""
+private val CLOCK_TAIL = Regex("""^(.*?)(?:(?:[\s\-–—|·@,(]|\bat\b)+|^)\(?($CLOCK)\)?\s*$""", RegexOption.IGNORE_CASE)
+
+/**
+ * Splits a trailing time of day off a separator label: 12 hour ("7p", "7a", "7pm", "7 pm", "7:30 p.m."), 24 hour ("19:00", "7:30", "19h", "19h30").
+ * The time can be all there is ("7pm"), so the title may come back empty. A bare number is not a time. Returns null when there is none.
+ */
+fun splitTrailingClock(text: String): Pair<String, String>? {
+    val m = CLOCK_TAIL.matchEntire(text.trim()) ?: return null
+    val title = m.groupValues[1].trim().trimEnd('-', '–', '—', '|', '·', '@', ',', '(', ' ')
+    return title to normalizeClock(m.groupValues[2])
+}
+
+private val CLOCK_12H = Regex("""^(\d{1,4})(?::([0-5]\d))?\s*([ap])\.?(?:m\.?)?$""", RegexOption.IGNORE_CASE)
+/** 12 hour times become "6 pm" / "6:30 pm": "6p", "630p", "6:30P", "6 p.m." all read the same. 24 hour times are left as typed. */
+fun normalizeClock(raw: String): String {
+    val t = raw.trim().replace(Regex("""\s+"""), " ")
+    val m = CLOCK_12H.matchEntire(t) ?: return t
+    val digits = m.groupValues[1]
+    val (h, min) = when {
+        m.groupValues[2].isNotEmpty() -> digits to m.groupValues[2]
+        digits.length <= 2 -> digits to ""
+        digits.length == 3 -> digits.substring(0, 1) to digits.substring(1)
+        else -> digits.substring(0, 2) to digits.substring(2)
+    }
+    val ap = if (m.groupValues[3].equals("a", true)) "am" else "pm"
+    return (h.toIntOrNull()?.toString() ?: h) + (if (min.isNotEmpty()) ":$min" else "") + " $ap"
 }
 
 class TaskViewModel(private val dao: TaskDao, private val prefs: android.content.SharedPreferences) : ViewModel() {
@@ -376,10 +444,10 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         .map { list -> list.groupBy { it.taskId } }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
 
-    fun editTask(task: TaskEntity, title: String, notes: String) {
+    fun editTask(task: TaskEntity, title: String, notes: String, duration: String) {
         val t = title.trim()
         if (t.isEmpty()) return
-        viewModelScope.launch { dao.updateText(task.id, t, notes.trim()) }
+        viewModelScope.launch { dao.updateText(task.id, t, notes.trim(), duration.trim()) }
     }
 
     fun addFocusSession(taskId: Long) {
@@ -401,11 +469,12 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
     }
 
     fun deleteSeparator(task: TaskEntity) { viewModelScope.launch { dao.delete(task) } }
-    fun setSeparatorLabel(task: TaskEntity, label: String) { viewModelScope.launch { dao.setLabel(task.id, label.trim()) } }
+    fun setSeparatorLabel(task: TaskEntity, label: String, duration: String) { viewModelScope.launch { dao.setLabel(task.id, label.trim(), duration.trim()) } }
     fun addSeparator(label: String) {
         viewModelScope.launch {
             val order = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L
-            dao.insert(TaskEntity(title = label.trim(), queueOrder = order, playlist = _playlist.value, isSeparator = true))
+            val (title, time) = splitTrailingClock(label) ?: (label.trim() to "")
+            dao.insert(TaskEntity(title = title, queueOrder = order, playlist = _playlist.value, isSeparator = true, duration = time))
         }
     }
 
@@ -448,9 +517,9 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         viewModelScope.launch {
             val baseOrder = (dao.getMaxQueueOrder() ?: System.currentTimeMillis()) + 10L
             val now = System.currentTimeMillis()
-            val entities = lines.mapIndexed { index, (line, done) ->
-                TaskEntity(title = line, notes = notes.trim(), queueOrder = baseOrder + (index * 10L), playlist = _playlist.value,
-                    isCompleted = done, completedAt = if (done) now else null)
+            val entities = lines.mapIndexed { index, l ->
+                TaskEntity(title = l.title, notes = notes.trim(), queueOrder = baseOrder + (index * 10L), playlist = _playlist.value,
+                    isCompleted = l.done, completedAt = if (l.done) now else null, duration = l.duration)
             }
             dao.insertAll(entities)
         }
@@ -465,14 +534,15 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         val lines = parseTaskLines(raw)
         if (lines.isEmpty()) return
         val now = System.currentTimeMillis()
-        insertBlock(afterId, lines.map { (line, done) ->
-            TaskEntity(title = line, playlist = _playlist.value, isCompleted = done, completedAt = if (done) now else null)
+        insertBlock(afterId, lines.map { l ->
+            TaskEntity(title = l.title, playlist = _playlist.value, isCompleted = l.done, completedAt = if (l.done) now else null, duration = l.duration)
         }, onPlaced)
     }
 
     /** A separator (the typed text is its label) slotted in right after [afterId]. */
     fun insertSeparatorAt(afterId: Long, label: String, onPlaced: (Long) -> Unit) {
-        insertBlock(afterId, listOf(TaskEntity(title = label.trim(), playlist = _playlist.value, isSeparator = true)), onPlaced)
+        val (title, time) = splitTrailingClock(label) ?: (label.trim() to "")
+        insertBlock(afterId, listOf(TaskEntity(title = title, playlist = _playlist.value, isSeparator = true, duration = time)), onPlaced)
     }
 
     /** Writes [entities] in order into the spot right after [afterId], in one transaction so the list changes once (nothing flashes at the bottom first). */
@@ -506,9 +576,9 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
         viewModelScope.launch {
             val currentMin = dao.getMinQueueOrder() ?: System.currentTimeMillis()
             val now = System.currentTimeMillis()
-            val entities = lines.mapIndexed { index, (line, done) ->
-                TaskEntity(title = line, notes = notes.trim(), queueOrder = currentMin - ((lines.size - index) * 10L),
-                    isCompleted = done, completedAt = if (done) now else null)
+            val entities = lines.mapIndexed { index, l ->
+                TaskEntity(title = l.title, notes = notes.trim(), queueOrder = currentMin - ((lines.size - index) * 10L),
+                    isCompleted = l.done, completedAt = if (l.done) now else null, duration = l.duration)
             }
             dao.insertAll(entities)
             onReady()
@@ -1208,7 +1278,7 @@ fun HomeScreen(
     tasks: List<TaskEntity>, subtasksByTask: Map<Long, List<SubtaskEntity>>, editor: EditorActions,
     onAddTasks: (String) -> Unit, onComplete: (TaskEntity) -> Unit, onUndoComplete: (TaskEntity) -> Unit,
     onReorder: (List<TaskEntity>) -> Unit, onSelect: (TaskEntity, Float) -> Unit, onOpenSettings: (Offset) -> Unit, onArchiveAll: () -> Unit, onArchiveTask: (TaskEntity) -> Unit,
-    onInsertAt: (Long, String, (Long) -> Unit) -> Unit, onInsertSeparatorAt: (Long, String, (Long) -> Unit) -> Unit, freshIds: List<Long>, onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String) -> Unit,
+    onInsertAt: (Long, String, (Long) -> Unit) -> Unit, onInsertSeparatorAt: (Long, String, (Long) -> Unit) -> Unit, freshIds: List<Long>, onAddSeparator: (String) -> Unit, onDeleteSeparator: (TaskEntity) -> Unit, onLabelSeparator: (TaskEntity, String, String) -> Unit,
     undoBanner: TaskViewModel.UndoBanner? = null, onUndo: () -> Unit = {}, onDismissUndo: () -> Unit = {},
     playlist: String, onPlaylist: (String, Offset) -> Unit, onRoll: () -> Unit, onCleaningToggle: (Offset) -> Unit,
     autoSelectId: Long?, returnId: Long?, returnY: Float, onReturnConsumed: () -> Unit,
@@ -1293,6 +1363,8 @@ fun HomeScreen(
     // the list does not move), then the keyboard closes, then the list glides back to where it was.
     var committing by remember { mutableStateOf(false) }
     val settleJob = remember { arrayOfNulls<kotlinx.coroutines.Job>(1) }
+    // Anything else you do (check a box, open or drag a row, swipe, archive) lets go of the chosen spot straight away.
+    fun dropSlot() { if (slotId != null) { settleJob[0]?.cancel(); committing = false; finishPlacing() } }
     fun settleThenFinish(rows: Int) {
         settleJob[0]?.cancel()
         settleJob[0] = scope.launch { delay(340L + 70L * (rows - 1).coerceAtLeast(0)); committing = false; finishPlacing() }
@@ -1304,7 +1376,11 @@ fun HomeScreen(
 
     // While the keyboard is up the list is nudged just enough to keep the marked line in view, and glides back afterwards (see SlotScroll).
     val imeUp = rememberImeUp()
-    SlotScroll(slotId, committing, listState, dockH, imeUp)
+    // Back with the keyboard up only closes the keyboard (the system takes that press), so closing it also lets go of the chosen spot.
+    var wasImeUp by remember { mutableStateOf(false) }
+    LaunchedEffect(imeUp) { if (wasImeUp && !imeUp && slotId != null && !committing) dropSlot(); wasImeUp = imeUp }
+    var slotPad by remember { mutableStateOf(false) }   // extra room below the list so even a short list can scroll the marked line to the middle
+    SlotScroll(slotId, committing, listState, dockH, imeUp) { slotPad = it }
     val seamTol = remember(density) { with(density) { 12.dp.toPx() } }
     val gapHalf = remember(density) { with(density) { 7.dp.toPx() } }
     fun it_seam(i: androidx.compose.foundation.lazy.LazyListItemInfo, marked: Long?, half: Float): Float = i.offset + i.size - (if (i.key == marked) half else 0f)
@@ -1312,6 +1388,8 @@ fun HomeScreen(
         awaitEachGesture {
             val first = awaitFirstDown(requireUnconsumed = false, pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial)
             if (selectingId != null || draggingId != null || items.isEmpty()) return@awaitEachGesture
+            // The add bar (and keyboard) sit on top of the list: a touch there belongs to the bar, never to a spot in the list under it.
+            if (first.position.y >= size.height - with(density) { dockH.toPx() }) return@awaitEachGesture
             val vis = listState.layoutInfo.visibleItemsInfo.filter { it.key != "top-slot" }
             val firstVis = vis.firstOrNull() ?: return@awaitEachGesture
             val lastVis = vis.last()
@@ -1390,7 +1468,7 @@ fun HomeScreen(
     // Double-tapping empty space opens the first open task through the same grow-into-focus animation as tapping it.
     fun startFirst() {
         if (selectingId != null || draggingId != null) return
-        slotId = null
+        dropSlot()
         val i = items.indexOfFirst { !it.isSeparator && !it.isCompleted }
         if (i < 0) return
         val id = items[i].id
@@ -1402,6 +1480,9 @@ fun HomeScreen(
         triggerHaptic(context, HapticStyle.TICK)
         onPlaylist("main", glyphRowCenter + Offset(with(density) { 24.dp.toPx() } * (if (playlist == "morning") -1 else 1), 0f))
     }
+
+    // Back lets go of a chosen spot (and its yellow line) before it does anything else.
+    BackHandler(enabled = slotId != null && selectingId == null) { dropSlot() }
 
     fun submit() {
         if (input.isNotBlank()) {
@@ -1445,7 +1526,7 @@ fun HomeScreen(
                 if (keepScreenOn) IconButton(onClick = { triggerHaptic(context, HapticStyle.TICK); onToggleKeepScreenOn() }, modifier = Modifier.size(38.dp)) {
                     Icon(Icons.Outlined.Visibility, contentDescription = "Eye is on. Tap to turn it off", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(19.dp))
                 }
-                IconButton(onClick = { triggerHaptic(context, HapticStyle.CONFIRM); Sfx.play(Sound.SWEEP); onArchiveAll() }, enabled = items.any { !it.isSeparator } && selectingId == null, modifier = Modifier.size(38.dp)) {
+                IconButton(onClick = { dropSlot(); triggerHaptic(context, HapticStyle.CONFIRM); Sfx.play(Sound.SWEEP); onArchiveAll() }, enabled = items.any { !it.isSeparator } && selectingId == null, modifier = Modifier.size(38.dp)) {
                     Icon(Icons.Outlined.MoveToInbox, contentDescription = "Archive all", tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (items.isNotEmpty()) 0.6f else 0.25f), modifier = Modifier.size(19.dp))
                 }
             }
@@ -1476,7 +1557,7 @@ fun HomeScreen(
             if (items.isEmpty()) {
                 Text(if (playlist == "cleaning") "Add tiny 2-minute cleans here." else "Nothing to do.", modifier = Modifier.align(Alignment.Center), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { translationY = pull }, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp + heldPad.value)) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { translationY = pull }, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp + heldPad.value + (if (slotPad) (screenHeightDp * 0.5f).dp else 0.dp))) {
                 item(key = "top-slot") {
                     val first = items.firstOrNull()
                     Column(Modifier.fillMaxWidth()) {
@@ -1493,6 +1574,7 @@ fun HomeScreen(
                     }
                     val freshIdx = freshIds.indexOf(task.id)
                     val onDragStartRow = {
+                        dropSlot()
                         triggerHaptic(context, HapticStyle.TICK)
                         focusManager.clearFocus()
                         draggingId = task.id
@@ -1536,13 +1618,13 @@ fun HomeScreen(
                     if (task.isSeparator) {
                         SeparatorRow(
                             task = task, fresh = freshIdx >= 0, freshDelay = freshIdx * 70, isDragging = isDragging, modifier = rowModifier, hidden = selectingId != null,
-                            dragTranslation = dragTranslation, onEdit = { editingSeparator = task }, onDelete = { onDeleteSeparator(task) },
+                            dragTranslation = dragTranslation, onEdit = { dropSlot(); editingSeparator = task }, onDelete = { dropSlot(); onDeleteSeparator(task) },
                             onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
                         )
                     } else TaskRow(
                         task = task, fresh = freshIdx >= 0, freshDelay = freshIdx * 70,
                         subtasks = subtasksByTask[task.id].orEmpty(),
-                        onOpen = { if (selectingId == null) { triggerHaptic(context, HapticStyle.TICK); editingId = task.id } },
+                        onOpen = { if (selectingId == null) { dropSlot(); triggerHaptic(context, HapticStyle.TICK); editingId = task.id } },
                         isDragging = isDragging,
                         modifier = rowModifier,
                         selection = when (selectingId) { null -> 0; task.id -> 2; else -> 1 },
@@ -1550,6 +1632,7 @@ fun HomeScreen(
                         autoSelect = (autoSelectId == task.id && readyId == task.id) || quickId == task.id,
                         onSelect = { y ->
                             if (selectingId == null && draggingId == null && !task.isCompleted) {
+                                dropSlot()
                                 quickId = null
                                 triggerHaptic(context, HapticStyle.CONFIRM)
                                 Sfx.play(Sound.TICK)
@@ -1560,9 +1643,9 @@ fun HomeScreen(
                             }
                         },
                         dragTranslation = dragTranslation,
-                        onCheck = { if (task.isCompleted) onUndoComplete(task) else onComplete(task) },
-                        onArchive = { onArchiveTask(task) },
-                        onToggleSub = editor.onToggleSub,
+                        onCheck = { dropSlot(); if (task.isCompleted) onUndoComplete(task) else onComplete(task) },
+                        onArchive = { dropSlot(); onArchiveTask(task) },
+                        onToggleSub = { dropSlot(); editor.onToggleSub(it) },
                         onDragStart = onDragStartRow, onDrag = onDragRow, onDragEnd = onDragEndRow
                     )
                     SlotLine(slotId == task.id && !committing)
@@ -1680,7 +1763,7 @@ fun HomeScreen(
     editingSeparator?.let { sep ->
         SeparatorEditorSheet(
             task = sep,
-            onSave = { onLabelSeparator(sep, it) },
+            onSave = { label, time -> onLabelSeparator(sep, label, time) },
             onRemove = { onDeleteSeparator(sep) },
             onClose = { editingSeparator = null }
         )
@@ -1689,15 +1772,19 @@ fun HomeScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SeparatorEditorSheet(task: TaskEntity, onSave: (String) -> Unit, onRemove: () -> Unit, onClose: () -> Unit) {
+fun SeparatorEditorSheet(task: TaskEntity, onSave: (String, String) -> Unit, onRemove: () -> Unit, onClose: () -> Unit) {
     var v by remember(task.id) { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(task.title)) }
+    val clockSplit = remember(task.id) { splitClockSuffix(task.duration) }
+    var timeV by remember(task.id) { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(clockSplit.first)) }
+    var ampm by remember(task.id) { mutableStateOf(clockSplit.second) }
+    var autoAmPm by remember(task.id) { mutableStateOf(false) }   // true while am/pm was picked by the app from the clock, not by a tap
     var focused by remember { mutableStateOf(false) }
     var removed by remember { mutableStateOf(false) }
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val primary = MaterialTheme.colorScheme.primary
-    val close = { if (!removed) onSave(v.text); onClose() }
+    val close = { if (!removed) onSave(v.text, joinClock(timeV.text, ampm)); onClose() }
     InWindowSheet(onDismiss = close) {
-        Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 20.dp)) {
             BasicTextField(
                 value = v, onValueChange = { v = it }, singleLine = true,
                 textStyle = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface),
@@ -1711,17 +1798,119 @@ fun SeparatorEditorSheet(task: TaskEntity, onSave: (String) -> Unit, onRemove: (
                     }
                 }
             )
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(8.dp))
+            DurationField(
+                timeV,
+                { new ->
+                    // Starting a time lights up am or pm to match the clock; a 24 hour time (13 and up) turns it off again, and so does emptying the box.
+                    val numeric = new.text.all { it.isDigit() || it == ':' || it == '.' || it == ' ' }
+                    if (timeV.text.isEmpty() && new.text.isNotEmpty() && ampm == null && numeric) { ampm = currentAmPm(); autoAmPm = true }
+                    // Anything that is not a time ("gg", "late") is free text: the auto am/pm steps aside, so does an empty box.
+                    if (autoAmPm && (new.text.isEmpty() || !numeric)) { ampm = null; autoAmPm = false }
+                    if (autoAmPm && (Regex("""^\s*(\d+)""").find(new.text)?.groupValues?.get(1)?.toIntOrNull() ?: 0) > 12) { ampm = null; autoAmPm = false }
+                    timeV = new
+                },
+                chips = listOf(":00", ":15", ":30", ":45"), onDone = close,
+                unitChips = listOf("am", "pm"), unit = ampm, onUnit = { ampm = it; autoAmPm = false }
+            )
+            Spacer(Modifier.height(10.dp))
             Box(Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.colorScheme.outline))
+            // Same quiet action style as the to-do editor's Note / 2-min sessions toggles.
             Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp).clip(RoundedCornerShape(12.dp)).clickable { removed = true; onRemove(); onClose() }.padding(vertical = 14.dp),
+                modifier = Modifier.padding(top = 6.dp).offset(x = (-10).dp).clip(RoundedCornerShape(12.dp)).clickable { removed = true; onRemove(); onClose() }.padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Outlined.Delete, contentDescription = null, tint = muted, modifier = Modifier.size(20.dp))
-                Spacer(Modifier.width(14.dp))
-                Text("Remove separator", style = MaterialTheme.typography.bodyLarge, color = muted)
+                Icon(Icons.Outlined.Delete, contentDescription = null, tint = muted.copy(alpha = 0.8f), modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(7.dp))
+                Text("Remove separator", style = MaterialTheme.typography.labelLarge, color = muted.copy(alpha = 0.8f))
             }
         }
+    }
+}
+
+private val UNIT_RE = Regex("""^(.*?)\s*(mins?|hrs?)$""", RegexOption.IGNORE_CASE)
+/** "15 mins" -> ("15", "mins"); text without a trailing unit comes back with a null unit. */
+fun splitDuration(s: String): Pair<String, String?> {
+    val m = UNIT_RE.matchEntire(s.trim()) ?: return s.trim() to null
+    return m.groupValues[1].trim() to (if (m.groupValues[2].lowercase().startsWith("m")) "mins" else "hrs")
+}
+/** "7:30 pm" / "7p" / "7:30 p.m." -> ("7:30", "pm"); anything else comes back with a null suffix. */
+fun splitClockSuffix(s: String): Pair<String, String?> {
+    // Saved by the editor as "<text> am" / "<text> pm": split it back out whatever the text is, so it never sits in the box.
+    Regex("""^(.*\S)\s+(am|pm)$""", RegexOption.IGNORE_CASE).matchEntire(s.trim())?.let { return it.groupValues[1].trim() to it.groupValues[2].lowercase() }
+    val m = Regex("""^(.*?)\s*([ap])\.?(?:m\.?)?$""", RegexOption.IGNORE_CASE).matchEntire(s.trim()) ?: return s.trim() to null
+    if (m.groupValues[1].isBlank() || !m.groupValues[1].last().isDigit()) return s.trim() to null
+    return m.groupValues[1].trim() to (if (m.groupValues[2].equals("a", true)) "am" else "pm")
+}
+/** The saved separator time: the typed time plus the lit am/pm (nothing is saved for an am/pm with no time). */
+fun joinClock(text: String, ampm: String?): String = if (text.isBlank()) "" else text.trim() + (if (ampm != null) " $ampm" else "")
+/** am before noon on the phone's clock, pm after. */
+fun currentAmPm(): String = if (java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY) < 12) "am" else "pm"
+
+/** The saved text: the number plus the active unit. A unit with no number is dropped. */
+fun joinDuration(text: String, unit: String?): String = when {
+    unit == null -> text.trim()
+    text.isBlank() -> ""
+    else -> text.trim() + " " + unit
+}
+/** For the list: "1 min", "15 mins", "1 hr", "2 hrs". Anything without a unit is shown as typed. */
+fun displayDuration(s: String): String {
+    val (num, unit) = splitDuration(s)
+    if (unit == null || num.any { it.isLetter() }) return s   // plain text, or hours + minutes ("2h 2mins"): shown as saved
+    val one = num == "1"
+    return num + " " + if (unit == "mins") (if (one) "min" else "mins") else (if (one) "hr" else "hrs")
+}
+
+/**
+ * A one-line free-text time box with chips at its end, shared by the to-do editor and the separator editor.
+ * With [unit]/[onUnit] the chips are switches: one lights up in the accent colour, tapping it again turns it off, and nothing is pasted.
+ * Without them (separators) a chip appends its text, e.g. ":30".
+ */
+@Composable
+fun DurationField(
+    value: androidx.compose.ui.text.input.TextFieldValue, onChange: (androidx.compose.ui.text.input.TextFieldValue) -> Unit, chips: List<String> = emptyList(),
+    onDone: () -> Unit, unitChips: List<String> = emptyList(), unit: String? = null, onUnit: ((String?) -> Unit)? = null,
+    placeholder: String = "Add a time"
+) {
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val primary = MaterialTheme.colorScheme.primary
+    // Append chips paste their text (":30"); unit chips are switches ("mins", "pm") and are never pasted.
+    @Composable
+    fun Chip(chip: String, isUnit: Boolean) {
+        val on = isUnit && unit == chip
+        Box(
+            modifier = Modifier.clip(RoundedCornerShape(50)).background(if (on) primary.copy(alpha = 0.14f) else Color.Transparent, RoundedCornerShape(50))
+                .border(1.dp, if (on) primary else muted.copy(alpha = 0.3f), RoundedCornerShape(50))
+                .clickable {
+                    if (isUnit) onUnit?.invoke(if (on) null else chip)
+                    else {
+                        // A minutes chip (":45") replaces minutes already there ("9:30" -> "9:45") instead of stacking on them.
+                        val base = if (chip.startsWith(":")) value.text.replace(Regex(""":\d{0,2}$"""), "") else value.text
+                        val t = base + chip; onChange(androidx.compose.ui.text.input.TextFieldValue(t, androidx.compose.ui.text.TextRange(t.length)))
+                    }
+                }.padding(horizontal = 11.dp, vertical = 5.dp)
+        ) { Text(chip, style = MaterialTheme.typography.labelMedium, color = if (on) primary else muted) }
+    }
+    Column {
+        // Row one: the time itself, with the on/off chips (mins, hrs / am, pm) at its end.
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Schedule, contentDescription = null, tint = muted.copy(alpha = 0.6f), modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(14.dp))
+            BasicTextField(
+                value = value, onValueChange = { onChange(it.copy(text = it.text.replace("\n", " "))) }, singleLine = true,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = muted, fontFeatureSettings = "tnum"),
+                cursorBrush = SolidColor(primary), modifier = Modifier.weight(1f),
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { onDone() }),
+                decorationBox = { inner ->
+                    Box { if (value.text.isEmpty()) Text(placeholder, maxLines = 1, softWrap = false, style = MaterialTheme.typography.bodyLarge, color = muted.copy(alpha = 0.5f)); inner() }
+                }
+            )
+            Spacer(Modifier.width(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) { unitChips.forEach { Chip(it, true) } }
+        }
+        // Row two (separators): the quick minutes, under the time, lined up with the text.
+        if (chips.isNotEmpty()) Row(Modifier.padding(start = 34.dp, top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) { chips.forEach { Chip(it, false) } }
     }
 }
 
@@ -1737,6 +1926,7 @@ fun SeparatorRow(
     val lightPage = MaterialTheme.colorScheme.background.luminance() > 0.5f
     val outline = if (lightPage) Color(0xFFB4B4BA) else Color.White.copy(alpha = 0.17f)
     val shape = RoundedCornerShape(16.dp)
+    val timeOnly = task.title.isBlank() && task.duration.isNotBlank()
     // A separator placed by tapping a spot fades in and settles down from just above.
     var appeared by remember(task.id) { mutableStateOf(!fresh) }
     LaunchedEffect(task.id) { if (!appeared) delay(freshDelay.toLong()); appeared = true }
@@ -1778,14 +1968,22 @@ fun SeparatorRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Row(
-            modifier = Modifier.weight(1f).height(14.dp).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onEdit() }.padding(start = 20.dp, end = 14.dp),
+            modifier = Modifier.weight(1f).height(if (timeOnly) 26.dp else 14.dp).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onEdit() }.padding(start = 20.dp, end = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (task.title.isNotBlank()) {
                 Text(task.title.uppercase(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.6.sp, fontWeight = FontWeight.Medium), color = if (lightPage) Color(0xFF8A8A90) else muted.copy(alpha = 0.45f), modifier = Modifier.widthIn(max = 240.dp))
                 Spacer(Modifier.width(12.dp))
             }
-            Box(Modifier.weight(1f).height(1.dp).background(outline))
+            // A separator that is only a time has no line: just the time, at the right.
+            if (timeOnly) Spacer(Modifier.weight(1f)) else Box(Modifier.weight(1f).height(1.dp).background(outline))
+            if (task.duration.isNotBlank()) {
+                if (!timeOnly) Spacer(Modifier.width(12.dp))
+                // A separator that is only a time is a marker in its own right: it takes the accent colour.
+                Text(task.duration, maxLines = 1, softWrap = false, style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 1.6.sp, fontWeight = FontWeight.Medium, fontFeatureSettings = "tnum"), color = if (timeOnly) MaterialTheme.colorScheme.primary else if (lightPage) Color(0xFF8A8A90) else muted.copy(alpha = 0.45f),
+                    // The accent time sits in a thin rounded outline.
+                    modifier = if (timeOnly) Modifier.border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.7f), RoundedCornerShape(8.dp)).padding(horizontal = 8.dp, vertical = 3.dp) else Modifier)
+            }
         }
     }
 }
@@ -1973,7 +2171,7 @@ fun TaskRow(
                 if (checked) Icon(Icons.Default.Check, contentDescription = "Completed. Tap to undo", tint = MaterialTheme.colorScheme.background, modifier = Modifier.size(14.dp))
             }
         }
-        Column(modifier = Modifier.weight(1f).combinedClickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onOpen, onDoubleClick = { onSelect(titleOrigin.y.coerceIn(minY, maxY)) }).padding(start = 6.dp, end = 18.dp, top = 14.dp, bottom = 14.dp)) {
+        Column(modifier = Modifier.weight(1f).combinedClickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onOpen, onDoubleClick = { onSelect(titleOrigin.y.coerceIn(minY, maxY)) }).padding(start = 6.dp, end = if (task.duration.isBlank()) 18.dp else 10.dp, top = 14.dp, bottom = 14.dp)) {
             Text(
                 task.title,
                 style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 21.sp, fontWeight = if (MaterialTheme.colorScheme.background.luminance() > 0.5f) FontWeight.Normal else FontWeight.Medium, letterSpacing = (-0.25).sp),
@@ -2029,6 +2227,16 @@ fun TaskRow(
                 }
             }
             if (task.focusSessions > 0) TimerBadgesFit(task.focusSessions, size = 20.dp, modifier = Modifier.graphicsLayer { alpha = partsAlpha }.padding(top = 6.dp))
+        }
+        // The time estimate: same colour as the title, smaller and lighter, level with the title's first line.
+        if (task.duration.isNotBlank()) {
+            Text(
+                displayDuration(task.duration), maxLines = 1, softWrap = false,
+                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp, lineHeight = 21.sp, fontWeight = if (MaterialTheme.colorScheme.background.luminance() > 0.5f) FontWeight.Light else FontWeight.Normal, fontFeatureSettings = "tnum"),
+                color = if (checked) muted.copy(alpha = 0.35f) else onBg.copy(alpha = 0.5f),
+                textDecoration = if (checked) TextDecoration.LineThrough else TextDecoration.None,
+                modifier = Modifier.graphicsLayer { alpha = partsAlpha }.padding(top = 14.dp, end = 18.dp)
+            )
         }
     }
 }
@@ -2178,6 +2386,10 @@ fun FocusScreen(
                                 textDecoration = if (finishing) TextDecoration.LineThrough else TextDecoration.None,
                                 modifier = Modifier.graphicsLayer { alpha = titleAlpha }.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { showEditor = true }
                             )
+                            if (current.duration.isNotBlank()) {
+                                Spacer(Modifier.height(8.dp))
+                                Text(displayDuration(current.duration), style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Light, fontFeatureSettings = "tnum"), color = muted)
+                            }
                             if (current.notes.isNotBlank()) {
                                 Spacer(Modifier.height(16.dp))
                                 Text(current.notes, textAlign = if (landscape) TextAlign.Center else TextAlign.Start, style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 26.sp), color = muted)
@@ -2509,9 +2721,10 @@ fun rememberImeUp(): Boolean {
  * Pressing add runs in order: rows appear (list holds still), keyboard closes, then the list glides back.
  */
 @Composable
-fun SlotScroll(slotId: Long?, committing: Boolean, listState: androidx.compose.foundation.lazy.LazyListState, dockH: Dp, imeUp: Boolean) {
+fun SlotScroll(slotId: Long?, committing: Boolean, listState: androidx.compose.foundation.lazy.LazyListState, dockH: Dp, imeUp: Boolean, onExtraRoom: (Boolean) -> Unit) {
     val ime = WindowInsets.ime
     val density = LocalDensity.current
+    val dockNow by rememberUpdatedState(dockH)   // read after the keyboard is up: the value this effect started with is from before it rose
     var adjustPx by remember { mutableFloatStateOf(0f) }   // how far we have scrolled the list for the line
     LaunchedEffect(Unit) { snapshotFlow { listState.isScrollInProgress }.collect { if (it) adjustPx = 0f } }
     suspend fun glide(delta: Float) {
@@ -2530,19 +2743,38 @@ fun SlotScroll(slotId: Long?, committing: Boolean, listState: androidx.compose.f
                 val back = adjustPx
                 if (back != 0f) glide(-back)
             }
+            onExtraRoom(false)
             return@LaunchedEffect
         }
         if (committing || slotId == null) return@LaunchedEffect   // rows are arriving: the list stays put
-        // Wait for the keyboard to finish rising, then bring the line into view only if it is hidden or too close to the dock.
-        var prev = -1
-        for (k in 0 until 25) { val b = ime.getBottom(density); if (b > 0 && b == prev) break; prev = b; delay(60) }
-        delay(60)
-        val info = listState.layoutInfo
+        // The list follows the keyboard as it rises: every time the add bar moves, the marked line is nudged to stay in the middle of
+        // what is left above it, so both happen together. Room below the list is made first so even a short list can scroll that far.
+        onExtraRoom(true)
         val key: Any = if (slotId == TOP_SEAM) "top-slot" else slotId
-        val item = info.visibleItemsInfo.firstOrNull { it.key == key } ?: return@LaunchedEffect
-        val lineY = item.offset + item.size - with(density) { 7.dp.toPx() } + info.beforeContentPadding
-        val bottomEdge = info.viewportSize.height - with(density) { dockH.toPx() }
-        if (lineY > bottomEdge - with(density) { 96.dp.toPx() } || lineY < with(density) { 24.dp.toPx() }) glide(lineY - bottomEdge * 0.4f)
+        fun lineError(): Float? {
+            val info = listState.layoutInfo
+            val item = info.visibleItemsInfo.firstOrNull { it.key == key } ?: return null
+            val lineY = item.offset + item.size - with(density) { 7.dp.toPx() } + info.beforeContentPadding
+            val topEdge = info.beforeContentPadding.toFloat()
+            val bottomEdge = info.viewportSize.height - with(density) { dockNow.toPx() }
+            return lineY - (topEdge + bottomEdge) / 2f
+        }
+        var first = true
+        snapshotFlow { dockNow }.collectLatest {
+            if (first) {
+                first = false
+                // First look: one smooth glide (right for picking another spot with the keyboard already up). If the keyboard is
+                // still rising, the next frame's change cancels this and the raw following below takes over.
+                val e = lineError() ?: return@collectLatest
+                if (kotlin.math.abs(e) > with(density) { 4.dp.toPx() }) glide(e)
+                return@collectLatest
+            }
+            lineError()?.let { e -> if (kotlin.math.abs(e) > 1f) adjustPx += listState.dispatchRawDelta(e) }
+            // Once the add bar stops moving, finish with a tiny smooth correction if the last frames fell short.
+            delay(160)
+            val e = lineError() ?: return@collectLatest
+            if (kotlin.math.abs(e) > with(density) { 4.dp.toPx() }) glide(e)
+        }
     }
 }
 
@@ -2712,7 +2944,7 @@ fun StuckOption(icon: androidx.compose.ui.graphics.vector.ImageVector, label: St
 }
 
 class EditorActions(
-    val onEditTask: (TaskEntity, String, String) -> Unit,
+    val onEditTask: (TaskEntity, String, String, String) -> Unit,
     val onAddSub: (Long, String) -> Unit,
     val onToggleSub: (SubtaskEntity) -> Unit,
     val onDeleteSub: (SubtaskEntity) -> Unit,
@@ -2775,12 +3007,15 @@ fun SubtaskList(
 fun TaskEditorSheet(task: TaskEntity, subtasks: List<SubtaskEntity>, actions: EditorActions, onClose: () -> Unit) {
     var titleV by remember(task.id) { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(task.title)) }
     var notesV by remember(task.id) { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(task.notes)) }
+    val split = remember(task.id) { splitDuration(task.duration) }
+    var timeV by remember(task.id) { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(split.first)) }
+    var unit by remember(task.id) { mutableStateOf(split.second) }
     val title = titleV.text
     val notes = notesV.text
     var focusedField by remember { mutableIntStateOf(0) } // 1 = title, 2 = notes
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val primary = MaterialTheme.colorScheme.primary
-    val close = { actions.onEditTask(task, title, notes); onClose() }
+    val close = { actions.onEditTask(task, title, notes, joinDuration(timeV.text, unit)); onClose() }
     // Enter saves and closes instead of adding a line. Pasted multi-line text just has its breaks turned into spaces.
     fun onEdit(old: androidx.compose.ui.text.input.TextFieldValue, new: androidx.compose.ui.text.input.TextFieldValue, set: (androidx.compose.ui.text.input.TextFieldValue) -> Unit) {
         if (!new.text.contains('\n')) { set(new); return }
@@ -2788,49 +3023,72 @@ fun TaskEditorSheet(task: TaskEntity, subtasks: List<SubtaskEntity>, actions: Ed
         if (new.text.length == old.text.length + 1 && new.text.replace("\n", "") == old.text) close() else set(new.copy(text = flat))
     }
 
+    // The rarely used parts stay folded until asked for (open from the start when they already hold something).
+    var noteOpen by remember(task.id) { mutableStateOf(task.notes.isNotBlank()) }
+    var sessionsOpen by remember(task.id) { mutableStateOf(task.focusSessions > 0) }
+    val noteFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    var wantNoteFocus by remember { mutableStateOf(false) }
+    LaunchedEffect(wantNoteFocus, noteOpen) { if (wantNoteFocus && noteOpen) { delay(120); runCatching { noteFocus.requestFocus() }; wantNoteFocus = false } }
+
     InWindowSheet(onDismiss = close) {
-        Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 20.dp)) {
             BasicTextField(
                 value = titleV, onValueChange = { onEdit(titleV, it) { v -> titleV = v } },
                 textStyle = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface),
                 cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) focusedField = 1 },
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences)
             )
-            Spacer(Modifier.height(10.dp))
-            BasicTextField(
-                value = notesV, onValueChange = { onEdit(notesV, it) { v -> notesV = v } },
-                textStyle = MaterialTheme.typography.bodyLarge.copy(color = muted),
-                cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) focusedField = 2 },
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                decorationBox = { inner ->
-                    Box {
-                        if (notes.isEmpty()) Text("Add a note", style = MaterialTheme.typography.bodyLarge, color = muted.copy(alpha = 0.5f))
-                        inner()
-                    }
-                }
-            )
-            Spacer(Modifier.height(20.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("2-minute sessions", style = MaterialTheme.typography.labelLarge, color = muted)
-                    Spacer(Modifier.height(8.dp))
-                    if (task.focusSessions > 0) TimerBadgesFit(task.focusSessions, size = 22.dp)
-                    else Text("None yet", style = MaterialTheme.typography.bodyMedium, color = muted.copy(alpha = 0.6f))
-                }
-                IconButton(onClick = { actions.onSetSessions(task.id, task.focusSessions - 1) }, enabled = task.focusSessions > 0) {
-                    Icon(Icons.Outlined.Remove, contentDescription = "Remove a session", tint = if (task.focusSessions > 0) muted else muted.copy(alpha = 0.3f))
-                }
-                IconButton(onClick = { actions.onSetSessions(task.id, task.focusSessions + 1) }) {
-                    Icon(Icons.Outlined.Add, contentDescription = "Add a session", tint = primary)
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-            Box(Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.colorScheme.outline))
             Spacer(Modifier.height(8.dp))
+            DurationField(timeV, { timeV = it }, onDone = close, unitChips = listOf("mins", "hrs"), unit = unit, onUnit = { unit = it })
+            Spacer(Modifier.height(10.dp))
+            Box(Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.colorScheme.outline))
+            Spacer(Modifier.height(4.dp))
             SubtaskList(
                 subtasks = subtasks, onToggle = actions.onToggleSub, onDelete = actions.onDeleteSub,
                 onAdd = { actions.onAddSub(task.id, it) }
             )
+            // Quiet toggles for the things used rarely.
+            Row(Modifier.padding(top = 6.dp).offset(x = (-10).dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                @Composable
+                fun Fold(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, open: Boolean, onClick: () -> Unit) {
+                    val tint = if (open) primary else muted.copy(alpha = 0.8f)
+                    Row(Modifier.clip(RoundedCornerShape(12.dp)).clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(7.dp))
+                        Text(label, style = MaterialTheme.typography.labelLarge, color = tint)
+                    }
+                }
+                Fold(Icons.Outlined.Notes, "Note", noteOpen) { noteOpen = !noteOpen; wantNoteFocus = noteOpen }
+                Fold(Icons.Outlined.Timer, "2-min sessions" + if (task.focusSessions > 0) " · ${task.focusSessions}" else "", sessionsOpen) { sessionsOpen = !sessionsOpen }
+            }
+            AnimatedVisibility(noteOpen, enter = expandVertically(tween(220)) + fadeIn(tween(220)), exit = shrinkVertically(tween(180)) + fadeOut(tween(150))) {
+                BasicTextField(
+                    value = notesV, onValueChange = { onEdit(notesV, it) { v -> notesV = v } },
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = muted),
+                    cursorBrush = SolidColor(primary), modifier = Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 4.dp).focusRequester(noteFocus).onFocusChanged { if (it.isFocused) focusedField = 2 },
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                    decorationBox = { inner ->
+                        Box {
+                            if (notes.isEmpty()) Text("Add a note", style = MaterialTheme.typography.bodyLarge, color = muted.copy(alpha = 0.5f))
+                            inner()
+                        }
+                    }
+                )
+            }
+            AnimatedVisibility(sessionsOpen, enter = expandVertically(tween(220)) + fadeIn(tween(220)), exit = shrinkVertically(tween(180)) + fadeOut(tween(150))) {
+                Row(Modifier.padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.weight(1f)) {
+                        if (task.focusSessions > 0) TimerBadgesFit(task.focusSessions, size = 22.dp)
+                        else Text("None yet", style = MaterialTheme.typography.bodyMedium, color = muted.copy(alpha = 0.6f))
+                    }
+                    IconButton(onClick = { actions.onSetSessions(task.id, task.focusSessions - 1) }, enabled = task.focusSessions > 0) {
+                        Icon(Icons.Outlined.Remove, contentDescription = "Remove a session", tint = if (task.focusSessions > 0) muted else muted.copy(alpha = 0.3f))
+                    }
+                    IconButton(onClick = { actions.onSetSessions(task.id, task.focusSessions + 1) }) {
+                        Icon(Icons.Outlined.Add, contentDescription = "Add a session", tint = primary)
+                    }
+                }
+            }
         }
     }
 }

@@ -188,7 +188,18 @@ class ListWidget : GlanceAppWidget() {
                             if (t.isSeparator) {
                                 Row(modifier = GlanceModifier.fillMaxWidth().padding(top = 12.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                                     if (t.title.isNotBlank()) { Text(t.title.uppercase(), maxLines = 1, style = TextStyle(color = ColorProvider(WMuted), fontSize = 10.sp, fontWeight = FontWeight.Medium)); Spacer(GlanceModifier.width(8.dp)) }
-                                    Box(modifier = GlanceModifier.defaultWeight().height(1.dp).background(WMuted.copy(alpha = 0.35f))) {}
+                                    if (t.title.isBlank() && t.duration.isNotBlank()) Spacer(GlanceModifier.defaultWeight()) else Box(modifier = GlanceModifier.defaultWeight().height(1.dp).background(WMuted.copy(alpha = 0.35f))) {}
+                                    if (t.duration.isNotBlank()) {
+                                        if (t.title.isBlank()) {
+                                            // A separator that is only a time: accent yellow in a thin rounded outline, like in the app.
+                                            Box(modifier = GlanceModifier.background(ImageProvider(R.drawable.widget_time_outline)).padding(horizontal = 6.dp, vertical = 2.dp)) {
+                                                Text(t.duration, maxLines = 1, style = TextStyle(color = ColorProvider(WAccent), fontSize = 10.sp, fontWeight = FontWeight.Medium))
+                                            }
+                                        } else {
+                                            Spacer(GlanceModifier.width(8.dp))
+                                            Text(t.duration, maxLines = 1, style = TextStyle(color = ColorProvider(WMuted), fontSize = 10.sp, fontWeight = FontWeight.Medium))
+                                        }
+                                    }
                                 }
                             } else Column(modifier = GlanceModifier.fillMaxWidth()) {
                             Row(modifier = GlanceModifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -201,6 +212,7 @@ class ListWidget : GlanceAppWidget() {
                                     t.title + (if (t.focusSessions > 0) "  ⏱${t.focusSessions}" else ""), maxLines = 1, style = TextStyle(color = ColorProvider(if (t.isCompleted) WMuted else WText), fontSize = 15.sp),
                                     modifier = GlanceModifier.defaultWeight().clickable(openApp)
                                 )
+                                if (t.duration.isNotBlank()) Text(displayDuration(t.duration), maxLines = 1, style = TextStyle(color = ColorProvider(if (t.isCompleted) WMuted else WMuted), fontSize = 12.sp))
                             }
                             // Its steps, indented under the title; each has its own check box.
                             subs[t.id].orEmpty().forEach { sub ->

@@ -34,8 +34,13 @@ object Backup {
         settings.forEach { (k, v) -> out.append(k).append(" = ").append(v).append("\n") }
 
         fun writeTask(t: TaskEntity, withArchivedAt: Boolean) {
-            if (t.isSeparator) { out.append(if (t.title.isBlank()) "---" else "--- ${esc(t.title)} ---").append("\n"); return }
+            if (t.isSeparator) {
+                out.append(if (t.title.isBlank()) "---" else "--- ${esc(t.title)} ---").append("\n")
+                if (t.duration.isNotBlank()) out.append("  time: ").append(esc(t.duration)).append("\n")
+                return
+            }
             out.append(if (t.isCompleted) "[x] " else "[ ] ").append(esc(t.title)).append("\n")
+            if (t.duration.isNotBlank()) out.append("  time: ").append(esc(t.duration)).append("\n")
             if (t.notes.isNotBlank()) out.append("  note: ").append(esc(t.notes)).append("\n")
             if (t.focusSessions > 0) out.append("  timers: ").append(t.focusSessions).append("\n")
             if (t.doneCount > 0) out.append("  done: ").append(t.doneCount).append("\n")
@@ -103,6 +108,7 @@ object Backup {
                             val t = tasks[last()]
                             val body = line.trim()
                             when {
+                                body.startsWith("time:") -> tasks[last()] = t.copy(duration = unesc(body.removePrefix("time:").trim()))
                                 body.startsWith("note:") -> tasks[last()] = t.copy(notes = unesc(body.removePrefix("note:").trim()))
                                 body.startsWith("timers:") -> tasks[last()] = t.copy(focusSessions = body.removePrefix("timers:").trim().toIntOrNull() ?: 0)
                                 body.startsWith("done:") -> tasks[last()] = t.copy(doneCount = body.removePrefix("done:").trim().toIntOrNull() ?: 0)
