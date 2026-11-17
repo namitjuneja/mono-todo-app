@@ -169,6 +169,9 @@ interface TaskDao {
     @Query("UPDATE tasks SET archivedFromList = 1, archivedAt = :now WHERE playlist = :playlist AND archivedFromList = 0 AND isSeparator = 0")
     suspend fun archiveCompleted(playlist: String, now: Long)
 
+    @Query("DELETE FROM tasks WHERE playlist = :playlist AND isSeparator = 1 AND archivedFromList = 0")
+    suspend fun deleteSeparators(playlist: String)
+
     @Query("UPDATE tasks SET archivedFromList = 1, archivedAt = :now WHERE id = :id")
     suspend fun archiveOne(id: Long, now: Long)
 
@@ -375,7 +378,10 @@ class TaskViewModel(private val dao: TaskDao, private val prefs: android.content
     }
 
     fun archiveAll() {
-        viewModelScope.launch { dao.archiveCompleted(_playlist.value, System.currentTimeMillis()) }
+        viewModelScope.launch {
+            dao.archiveCompleted(_playlist.value, System.currentTimeMillis())
+            dao.deleteSeparators(_playlist.value)   // archiving everything clears the separators too
+        }
     }
 
     fun setFocusSessions(taskId: Long, count: Int) {
@@ -1744,7 +1750,7 @@ fun HomeScreen(
             onDismissRequest = { confirmArchiveAll = false },
             containerColor = MaterialTheme.colorScheme.surface,
             title = { Text("Archive everything?") },
-            text = { Text("This moves all $n ${if (n == 1) "task" else "tasks"} on this list to the archive. You can send them back from there.") },
+            text = { Text("This moves all $n ${if (n == 1) "task" else "tasks"} on this list to the archive and removes the separators. You can send the tasks back from there.") },
             confirmButton = {
                 TextButton(onClick = { confirmArchiveAll = false; triggerHaptic(context, HapticStyle.CONFIRM); Sfx.play(Sound.SWEEP); onArchiveAll() }) { Text("Archive all", color = MaterialTheme.colorScheme.primary) }
             },

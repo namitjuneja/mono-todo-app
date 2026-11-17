@@ -19,7 +19,7 @@ An Android to-do app that cuts list overwhelm by putting one task in front of yo
 - **Insert above the first to-do** – when the list starts with a to-do, a small empty space sits above it. Press and hold it: same as between two tasks. Let go for a new to-do at the very top, keep holding and it collapses into a separator at the top. When the list starts with a separator, hold the separator instead (below).
 - **Insert next to a separator** – press and hold a separator anywhere: it lifts so you can drag it. Keep holding still for about a second and an empty to-do opens just below it; drag the separator past that row and the new to-do glides above it.
 - **Add bar** – one task per line. Markdown is understood: bullets (`-`, `*`, `+`, `1.`), checklists (`- [ ]`, `- [x]`), and `**bold**`, `~~strike~~` and backticks are stripped. A ticked box or a ~~crossed out~~ item arrives already done.
-- **Archive** – swipe left on a task, or archive the whole list from the top bar (it asks first).
+- **Archive** – swipe left on a task, or archive the whole list from the top bar (it asks first). Archiving the whole list also deletes its separators.
 - **Nothing archives itself.**
 
 ### Separators
